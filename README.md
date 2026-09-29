@@ -1,268 +1,71 @@
-📌 **Project Title:** **THE PROJECTING AN AUTONOMOUS ROBOT OF THE RESCUE MAZE CATEGORY**  
-📅 **Project Timeline:** **August 2019 – October 2021**  
-🎥 YouTube Demo: [Link: https://youtu.be/3sTD7d_HzC4](https://youtu.be/3sTD7d_HzC4)  
-📦 GitHub Source Code: <https://github.com/IvanSicaja/2019.08.01_GitHub_The-Projecting-an-Autonomous-Robot-of-the-Rescue-Maze-Category>  
+# Tree Editor
 
----
+A PyCharm-style editor for plain-text structure trees. Files stay **pure UTF-8 `.txt`**
+in exactly this format (4 columns per level, explanations after `#`):
 
-📍 My Personal Profiles ⬇︎  
-🎥 Video Portfolio: To be added  
-📦 GitHub Profile: <https://github.com/IvanSicaja>  
-👔 LinkedIn: <https://www.linkedin.com/in/ivan-si%C4%8Daja-832682222>  
-🎥 YouTube: <https://www.youtube.com/@ivan_sicaja>  
-
----
-
-### 💡 Core Challenge This Project Resolves:
-
-Designing and engineering a fully integrated autonomous rescue robot capable of real-time perception, decision-making, navigation, victim detection, and mechanical adaptability in unpredictable maze environments under hardware and computational constraints.
-
----
-
-### 🔧 Core Skills Tree Used To Build The Project - Skills and Tech Stack:
-*(Project-Specific Structured Overview)*
 ```
+project-name/
 │
-├── Software Engineering
-│ ├── Software / Frameworks / Libraries
-│ │ ├── Python
-│ │ ├── C++ (Arduino firmware development)
-│ │ ├── TensorFlow
-│ │ ├── Keras
-│ │ ├── OpenCV
-│ │ ├── scikit-learn
-│ │ ├── Pandas
-│ │ ├── Git / GitHub
-│ │ ├── Linux
-│ │ ├── Visual Studio Code
-│ │ └── Turtle (Python – maze visualization & mapping)
-│ │
-│ ├── Hardware
-│ │ ├── Raspberry Pi 4B
-│ │ ├── Teensy 3.5
-│ │ └── Arduino
-│ │
-│ └── Skills
-│   ├── Embedded software development & firmware programming
-│   ├── Real-time sensor data acquisition & processing
-│   ├── Computer vision pipeline architecture
-│   ├── AI model training, validation & optimization
-│   ├── Implementation of search algorithms (BFS, DFS, A*)
-│   ├── Linux-based robotics workflow management
-│   ├── System-level debugging & integration
-│   ├── Performance optimization under limited computational resources
-│   └── Multi-controller distributed architecture design
-│
-├── Mechanical Engineering
-│ ├── Software / Frameworks / Libraries
-│ │ └── Autodesk Fusion 360 (CAD/CAM design & simulation)
-│ │
-│ ├── Hardware / Hardware Tools
-│ │ └── Ultimaker 3+ (3D printing system)
-│ │
-│ └── Skills
-│   ├── Full robot chassis design & assembly modeling
-│   ├── Drivetrain engineering & torque optimization
-│   ├── 25-degree incline climbing capability design
-│   ├── Independent axle maneuvering mechanism
-│   ├── Structural strength & grip optimization
-│   ├── 3D printing parameter optimization (density, material selection)
-│   ├── Prototype validation & mechanical stress evaluation
-│   └── Mechanical-electrical integration alignment
-│
-├── Electrical Engineering
-│ ├── Software / Frameworks / Libraries
-│ │ └── Arduino IDE
-│ │
-│ ├── Hardware Components
-│ │ ├── Teensy 3.5
-│ │ ├── Raspberry Pi 4B
-│ │ ├── Arduino boards
-│ │ ├── Optical cameras (2x)
-│ │ ├── Thermal cameras (2x)
-│ │ ├── IR LiDAR sensors (6x)
-│ │ ├── Color sensor
-│ │ ├── Wheel encoders
-│ │ └── Motors & motor drivers
-│ │
-│ ├── Hardware Tools
-│ │ └── Power supply
-│ │
-│ ├── Communication Protocols
-│ │ ├── UART / Serial
-│ │ ├── I2C
-│ │ ├── SPI
-│ │ └── USB
-│ │
-│ └── Skills
-│   ├── Sensor calibration & integration
-│   ├── Signal filtering & noise reduction
-│   ├── Encoder-based position tracking systems
-│   ├── Multi-board communication architecture
-│   ├── Electrical system wiring & validation
-│   ├── Hardware troubleshooting & diagnostics
-│   ├── Power management & distribution optimization
-│   └── Embedded hardware-software synchronization
-│
-├── Data Science & Artificial Intelligence
-│ ├── Software / Frameworks / Libraries
-│ │ ├── TensorFlow
-│ │ ├── Keras
-│ │ ├── OpenCV
-│ │ ├── Pandas
-│ │ └── scikit-learn
-│ │
-│ ├── Hardware
-│ │ └── (Camera systems & sensors integrated via Raspberry Pi 4B)
-│ │
-│ └── Skills
-│   ├── Convolutional Neural Network (CNN) architecture design
-│   ├── OCR model training & evaluation (77.54% accuracy target)
-│   ├── Image preprocessing (grayscale, Gaussian blur, threshold, dilation)
-│   ├── Edge detection & dynamic noise filtering
-│   ├── Custom object detection scripting
-│   ├── Maze mapping & graph representation
-│   ├── Shortest-path computation using BFS, DFS, A*
-│   ├── Data transformation for performance acceleration (.CSV optimization)
-│   └── Overfitting prevention & model generalization strategies
-│
-└── Research & Development Engineering
-  ├── Software / Frameworks / Libraries
-  │ └── Integrated within sections above
-  │
-  ├── Hardware / Hardware Tools
-  │ └── Integrated within sections above
-  │
-  └── Skills
-    ├── System architecture design from concept to prototype
-    ├── Hardware feasibility analysis & component selection
-    ├── Iterative testing & calibration cycles
-    ├── Cross-disciplinary engineering coordination
-    ├── Technical documentation & publication preparation
-    ├── Experimental validation & benchmarking
-    └── End-to-end robotics system development
+├── assets/                       # Additional project resources
+│   ├── 01_media/                 # Organized media resources
+│   └── 02_3d-modeling/           # 3D objects
+│                                 # CAD files, simulation models, renders
+└── README.md                     # Project overview
 ```
 
----
+## Run
 
-### 📋 Core System Capabilities - List Only:
+```
+pip install -r requirements.txt
+python tree_editor.py                          # new tree
+python tree_editor.py example_project_tree.txt # open a file
+```
+You can also drag a .txt file onto the window.
 
-- **Autonomous character recognition (OCR)**
-- **Autonomous color recognition**
-- **Partially autonomous drive in the maze** (need a lot of testing and calibration for fully autonomous drive and labyrinth mapping)
-- **Thermal victim recognition**
-- **Package delivery**
-- **Ability to master a climb of 25 degrees** (all-wheel drive, strong grip)
-- **Independent axle maneuvering**
-- **Remembering positions (encoders)**...
+## Folding
 
----
+| Action | How |
+|---|---|
+| Collapse all / Expand all | `Alt+1` / `Alt+4` (toolbar: ⊟ / ⊞) |
+| Collapse one level / Expand one level (whole document) | `Alt+2` / `Alt+3` (toolbar: − Level / + Level) |
+| Show exactly N levels | `Ctrl+1` … `Ctrl+9`, or the **Levels** box |
+| Toggle one branch | click ▼/▶ next to the line number, or `Ctrl+.` |
+| Collapse / expand a branch with everything inside | `Alt`+click the arrow, or `Ctrl+Shift+.` / `Ctrl+Shift+,` |
+| Open a folded branch | click its `⋯ N items` badge |
 
-### 🧠️ How It Works - Core System Capabilities Workflow:
+"One level" is document-wide and standardizing: every branch ends up showing the
+same number of levels, so a mixed state becomes a clean overview.
 
-The project is very complex and demands knowledge in different areas (**3D modeling, 3D printing, advanced programming skills in different languages, researching ability, expert knowledge of every electrical component working principles, image processing, cause-and-effect analysis...**)  
-The brains of the robot are **microcontroller Teensy 3.5** and **Raspberry Pi 4B**.
+## Editing
 
-The robot is also equipped with:
+| Action | How |
+|---|---|
+| New item on the same level | `Enter` at the end of a name, or `Ctrl+Enter` |
+| New sub-item | `Ctrl+Shift+Enter` (Enter on an open branch also adds a first sub-item) |
+| Move right / left one level | `Tab` / `Shift+Tab` (or `Alt+Shift+→ / ←`) |
+| Move up / down (with all sub-items) | `Alt+Shift+↑ / ↓` |
+| Edit name & explanation | `F2` (explanation only: `Ctrl+E`); each explanation line becomes a `#` line |
+| Duplicate / delete a branch | `Ctrl+D` / `Ctrl+Shift+Delete` |
+| Finish a list | `Enter` on an empty item moves it one level left; `Backspace` removes it |
+| Split a name | `Enter` in the middle of a name |
+| Plain newline | `Shift+Enter` |
+| Format document | `Ctrl+Alt+L` (also automatic on save; can be turned off in Settings) |
+| Find | `Ctrl+F`, `F3`, `Shift+F3` (folded branches open automatically) |
 
-- **2x optical camera**
-- **2x thermal camera**
-- **6x IR lidar sensor**
-- **1x color sensor**... (more can be found at GitHub in my publication paper: _The projecting an autonomous robot of the rescue maze category.pdf_ -> Caption 4.3)
+Every structural action redraws all `│ ├── └──` lines and re-aligns explanations,
+and is a single `Ctrl+Z` undo step. You can also type freely like in any text
+editor; indented names without connectors (or ASCII `|--`, `` `-- ``) are
+understood and fixed by **Format**.
 
-**Optical character recognition:**  
-In this project, we trained a **Convolutional Neural Network (CNN)** on an image examples with the Python module **TensorFlow**. Images are converted into **.CSV file** because of speeder processing. The input image is filtered with different filters (**Grayscale, Gaussian Blur, Threshold, Binary, Dilatation**) in order to speed up image processing (replace three color channels with one channel, **RGB -> grayscale**). Reduce noises (the dust on the live video capturing). Getting smooth and sharp character edges is the most important characteristic for successful character recognition. The trained model accuracy is **77.54%** which is a target because we want to get high reliability and avoid CNN overfitting.
+Explanation alignment: `#` starts at column 34 at minimum; siblings written
+together (no blank `│` line between them) share one column so long names never
+break alignment. Both numbers are in **View → Settings**.
 
-**Object detection:**  
-Developed the custom script with the Python computer vision module **OpenCV** which filters the character that should be recognized from the other objects in the robot's surroundings. The script works on the principle of **character height and proportion**, together with the **dynamic noise filtering**.
+## Files
+* `tree_editor.py` – the application
+* `treemodel.py` – parser/formatter/tree operations (no GUI, reusable)
+* `test_treemodel.py` – `python -m unittest test_treemodel.py`
+* `example_project_tree.txt` – your project structure
 
-**Maze mapping:**  
-Maze mapping is done in my Python module **Turtle**. Every maze field is properly recognized by the robot's **distance and color sensors**. After all maze fields are mapped, they are sent to the backend and the shortest path is calculated by the artificial intelligence searching algorithms such as: _Breadth-First Search, Depth-First Search, A Algorithm_\*...
-
-**Hardware choosing and connecting:**  
-The entire process of choosing **hardware platforms, supported protocols, and hardware capabilities** is done. E.g. the **video camera** must have a corresponding **focal length** otherwise it will be useless, **framerate, resolution, additional light source**, **motors** should have expected speed, **distance sensors** should be precise and able to work in a maze, **robot brain** should be able to do high computation payload and support Python…
-
-**Frame design and 3D printing:**  
-Entire robot is **3D designed** with **Fusion 360 CAD/CAM** software and **3D printed** with the **Ultimaker 3+** 3D printer with corresponding **filament, density**, etc.
-
-**Developing mechatronic code:**  
-**Arduino** is used to control all **sensors and actuators** on the robot except the **camera** which is controlled by **Raspberry Pi 4B** computer.
-
----
-
-### ⚠️ Note:
-
-Achieving fully **autonomous drive** and **labyrinth mapping** requires extensive testing and calibration.  
-I would especially like to thank **Mirko Pezo** and **Stjepan Mikulic** for their exceptional contribution to the development of this project .
-
----
-
-### 📸 Project Snapshots:
-
-<p align="center">
-  <img src="https://github.com/IvanSicaja/2019.08.01_GitHub_The-Projecting-an-Autonomous-Robot-of-the-Rescue-Maze-Category/blob/main/publish/2.0_Thumbnail_1.png?raw=true" 
-       alt="Rescue Maze Robot Preview 1" 
-       width="640" 
-       height="360">
-</p>
-
-<p align="center">
-  <img src="https://github.com/IvanSicaja/2019.08.01_GitHub_The-Projecting-an-Autonomous-Robot-of-the-Rescue-Maze-Category/blob/main/publish/2.0_Thumbnail_2.png?raw=true" 
-       alt="Rescue Maze Robot Preview 2" 
-       width="640" 
-       height="360">
-</p>
-
-<p align="center">
-  <img src="https://github.com/IvanSicaja/2019.08.01_GitHub_The-Projecting-an-Autonomous-Robot-of-the-Rescue-Maze-Category/blob/main/publish/2.0_Thumbnail_3.png?raw=true" 
-       alt="Rescue Maze Robot Preview 3" 
-       width="640" 
-       height="360">
-</p>
-
-<p align="center">
-  <img src="https://github.com/IvanSicaja/2019.08.01_GitHub_The-Projecting-an-Autonomous-Robot-of-the-Rescue-Maze-Category/blob/main/publish/2.0_Thumbnail_4.png?raw=true" 
-       alt="Rescue Maze Robot Preview 4" 
-       width="640" 
-       height="360">
-</p>
-
-<p align="center">
-  <img src="https://github.com/IvanSicaja/2019.08.01_GitHub_The-Projecting-an-Autonomous-Robot-of-the-Rescue-Maze-Category/blob/main/publish/2.0_Thumbnail_5.png?raw=true" 
-       alt="Rescue Maze Robot Preview 5" 
-       width="640" 
-       height="360">
-</p>
-
-<p align="center">
-  <img src="https://github.com/IvanSicaja/2019.08.01_GitHub_The-Projecting-an-Autonomous-Robot-of-the-Rescue-Maze-Category/blob/main/publish/2.0_Thumbnail_6.png?raw=true" 
-       alt="Rescue Maze Robot Preview 6" 
-       width="640" 
-       height="360">
-</p>
-
-<p align="center">
-  <img src="https://github.com/IvanSicaja/2019.08.01_GitHub_The-Projecting-an-Autonomous-Robot-of-the-Rescue-Maze-Category/blob/main/publish/2.0_Thumbnail_7.png?raw=true" 
-       alt="Rescue Maze Robot Preview 7" 
-       width="640" 
-       height="360">
-</p>
-
----
-
-### 🎥 Video Demonstration:
-
-<p align="center">
-  <a href="https://youtu.be/3sTD7d_HzC4">
-    <img src="https://img.youtube.com/vi/3sTD7d_HzC4/0.jpg" 
-         alt="Watch the demo" 
-         width="640" 
-         height="1000">
-  </a>
-</p>
-
----
-
-### 📣 Hashtags Section:
-
-**#AutonomousRobotics #RescueMaze #RoboticsEngineering #AI #ComputerVision #OCR #ObjectDetection #PathPlanning #CNN #TensorFlow #OpenCV #EmbeddedSystems #RaspberryPi #Arduino #3DPrinting #Fusion360 #Mechatronics #AutonomousNavigation #MachineLearning**
+Saving is atomic (temp file + rename), keeps the file's line endings (LF/CRLF),
+and asks before discarding unsaved changes.
