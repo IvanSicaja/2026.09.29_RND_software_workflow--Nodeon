@@ -2,9 +2,9 @@
 """
 Nodeon - a plain-.txt editor for box-drawing structure trees.
 
-    python main/main.py [file.txt]
+    python main/Nodeon.py [file.txt]
 
-main.py (this file) is the application; it needs treemodel.py next to it.
+Nodeon.py (this file) is the application; it needs treemodel.py next to it.
 
 The file on disk is always pure UTF-8 text in this format:
 
@@ -27,11 +27,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PySide6.QtCore import (QByteArray, QEvent, QIODevice, QPointF, QRect, QRectF,
                             QSaveFile, QSettings, QSize, Qt, QTimer, Signal)
-from PySide6.QtGui import (QAction, QColor, QFont, QFontDatabase, QFontMetricsF,
+from PySide6.QtGui import (QAction, QColor, QFont, QFontDatabase, QFontMetrics, QFontMetricsF,
+                           QIcon, QPainterPath, QPen, QPixmap,
                            QKeySequence, QPainter, QPalette, QPolygonF,
                            QSyntaxHighlighter, QTextCharFormat, QTextCursor,
                            QTextFormat)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
+                               QStyle, QStyleOptionToolButton, QStylePainter,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
                                QSpinBox, QTextEdit, QToolBar, QToolButton,
@@ -43,6 +45,8 @@ APP_NAME = "Nodeon"
 APP_VERSION = "1.0.0"
 COLLAPSED = 1                      # QTextBlock.userState() flag of a folded branch
 NEW_DOCUMENT = "new-project/\n│\n└── "
+DEFAULT_FONT_SIZE = 12.0           # editor font size (pt)
+UI_VERSION = 2                     # bump to re-apply first-start layout defaults
 
 
 # --------------------------------------------------------------------------- #
@@ -209,7 +213,7 @@ class TreeEditor(QPlainTextEdit):
         self.setFrameShape(QPlainTextEdit.Shape.NoFrame)
         self.gutter = FoldGutter(self)
         self.highlighter = TreeHighlighter(self.document(), self.theme)
-        self.set_font_size(11)
+        self.set_font_size(DEFAULT_FONT_SIZE)
 
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -917,6 +921,187 @@ class TreeEditor(QPlainTextEdit):
 
 
 # --------------------------------------------------------------------------- #
+# Toolbar icons (drawn as vectors, so they are sharp at any size and theme)
+# --------------------------------------------------------------------------- #
+def _draw_icon(p: QPainter, kind: str) -> None:
+    """Draw a minimal line icon in a 24x24 coordinate space."""
+    def line(*pts) -> None:
+        path = QPainterPath(QPointF(*pts[0]))
+        for pt in pts[1:]:
+            path.lineTo(QPointF(*pt))
+        p.drawPath(path)
+
+    def chevron(y: float, up: bool) -> None:
+        d = -2.5 if up else 2.5
+        line((7, y - d), (12, y + d), (17, y - d))
+
+    def plus(cx: float, cy: float, r: float) -> None:
+        line((cx - r, cy), (cx + r, cy))
+        line((cx, cy - r), (cx, cy + r))
+
+    if kind == "open":
+        line((3, 18.5), (3, 5.5), (9.5, 5.5), (11.5, 7.5), (19, 7.5), (19, 10))
+        line((3, 18.5), (6, 11), (21.5, 11), (18.5, 18.5), (3, 18.5))
+    elif kind == "save":
+        line((12, 3.5), (12, 14.5))
+        line((7.5, 10), (12, 14.5), (16.5, 10))
+        line((4, 15), (4, 20), (20, 20), (20, 15))
+    elif kind in ("collapse_all", "collapse_level", "expand_all", "expand_level"):
+        line((5, 4.5), (19, 4.5))                       # the level we fold into
+        up = kind.startswith("collapse")
+        if kind.endswith("_all"):
+            chevron(11.5, up)
+            chevron(17.5, up)
+        else:
+            chevron(14, up)
+    elif kind == "add_item":
+        line((5, 3), (5, 21))
+        line((5, 12), (10, 12))
+        plus(16.5, 12, 4)
+    elif kind == "add_child":
+        p.drawEllipse(QPointF(6, 5), 2.2, 2.2)          # parent item
+        line((6, 7.5), (6, 15), (11, 15))               # branch into it
+        plus(17, 15, 3.5)
+    elif kind == "edit":
+        line((15, 4), (20, 9), (9, 20), (4, 20), (4, 15), (15, 4))
+        line((12.5, 6.5), (17.5, 11.5))
+    elif kind == "delete":
+        line((4, 6.5), (20, 6.5))
+        line((9, 6.5), (9, 3.5), (15, 3.5), (15, 6.5))
+        line((6, 6.5), (7, 20.5), (17, 20.5), (18, 6.5))
+        line((10, 10), (10, 17))
+        line((14, 10), (14, 17))
+    elif kind in ("up", "down", "left", "right"):
+        tail, head, wing1, wing2 = {
+            "up": ((12, 20), (12, 4), (6, 10), (18, 10)),
+            "down": ((12, 4), (12, 20), (6, 14), (18, 14)),
+            "left": ((20, 12), (4, 12), (10, 6), (10, 18)),
+            "right": ((4, 12), (20, 12), (14, 6), (14, 18)),
+        }[kind]
+        line(tail, head)
+        line(wing1, head, wing2)
+    elif kind == "format":                              # names + aligned explanations
+        for y, x_end in ((6, 9), (12, 12), (18, 7)):
+            line((4, y), (x_end, y))
+            line((15, y), (20, y))
+
+
+def make_icon(kind: str, color: str) -> QIcon:
+    icon = QIcon()
+    for size in (16, 20, 24, 32, 48, 64):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.scale(size / 24.0, size / 24.0)
+        pen = QPen(QColor(color), 1.8 if size >= 24 else 2.1)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        _draw_icon(p, kind)
+        p.end()
+        icon.addPixmap(pm)
+    return icon
+
+
+def shortcut_text(action: QAction) -> str:
+    seqs = action.shortcuts()
+    if not seqs:
+        return ""
+    text = seqs[0].toString(QKeySequence.SequenceFormat.NativeText)
+    for a, b in (("Return", "Enter"), ("Delete", "Del"), ("Up", "↑"),
+                 ("Down", "↓"), ("Left", "←"), ("Right", "→")):
+        text = text.replace(a, b)
+    return text
+
+
+def _caption_font(base: QFont) -> QFont:
+    f = QFont(base)
+    f.setPointSizeF(max(6.5, base.pointSizeF() - 1.5))
+    return f
+
+
+def _captioned(widget: QWidget, caption: str) -> QWidget:
+    """A toolbar widget with a small shortcut caption underneath."""
+    box = QWidget()
+    lay = QVBoxLayout(box)
+    lay.setContentsMargins(6, 2, 6, 2)
+    lay.setSpacing(3)
+    lay.addStretch()
+    lay.addWidget(widget)
+    label = QLabel(caption)
+    label.setFont(_caption_font(label.font()))
+    label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+    label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
+    lay.addWidget(label)
+    return box
+
+
+class ActionButton(QToolButton):
+    """Toolbar button: icon, name, and its keyboard shortcut underneath."""
+    ICON = 24
+
+    def __init__(self, action: QAction, label: str) -> None:
+        super().__init__()
+        self._label = label
+        self.setDefaultAction(action)
+        self.setText(label)
+        self.setAutoRaise(True)
+        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        action.changed.connect(self._on_action_changed)
+
+    def _on_action_changed(self) -> None:
+        self.setText(self._label)        # keep our short label, not the menu text
+        self.updateGeometry()
+        self.update()
+
+    def _keys(self) -> str:
+        return shortcut_text(self.defaultAction())
+
+    def sizeHint(self) -> QSize:
+        fm = QFontMetrics(self.font())
+        sm = QFontMetrics(_caption_font(self.font()))
+        w = max(fm.horizontalAdvance(self._label), sm.horizontalAdvance(self._keys()),
+                self.ICON) + 18
+        h = 5 + self.ICON + 4 + fm.height() + 1 + sm.height() + 5
+        return QSize(max(w, 58), h)
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def paintEvent(self, event) -> None:
+        p = QStylePainter(self)
+        opt = QStyleOptionToolButton()
+        self.initStyleOption(opt)
+        opt.text = ""
+        opt.icon = QIcon()
+        p.drawComplexControl(QStyle.ComplexControl.CC_ToolButton, opt)  # hover/press panel
+
+        enabled = self.isEnabled()
+        group = QPalette.ColorGroup.Active if enabled else QPalette.ColorGroup.Disabled
+        pal = self.palette()
+        r = self.rect()
+        y = 5
+        self.defaultAction().icon().paint(
+            p, QRect((r.width() - self.ICON) // 2, y, self.ICON, self.ICON),
+            Qt.AlignmentFlag.AlignCenter,
+            QIcon.Mode.Normal if enabled else QIcon.Mode.Disabled)
+        y += self.ICON + 4
+        fm = QFontMetrics(self.font())
+        p.setFont(self.font())
+        p.setPen(pal.color(group, QPalette.ColorRole.ButtonText))
+        p.drawText(QRect(0, y, r.width(), fm.height()), Qt.AlignmentFlag.AlignHCenter, self._label)
+        y += fm.height() + 1
+        small = _caption_font(self.font())
+        p.setFont(small)
+        p.setPen(pal.color(group, QPalette.ColorRole.PlaceholderText))
+        p.drawText(QRect(0, y, r.width(), QFontMetrics(small).height()),
+                   Qt.AlignmentFlag.AlignHCenter, self._keys())
+
+
+# --------------------------------------------------------------------------- #
 # Dialogs and find bar
 # --------------------------------------------------------------------------- #
 class EditNodeDialog(QDialog):
@@ -1115,7 +1300,11 @@ class MainWindow(QMainWindow):
             int(self.settings.value("min_comment_column", 34)),
             int(self.settings.value("comment_gap", 3)))
         self.format_on_save = self.settings.value("format_on_save", True, type=bool)
-        self.editor.set_font_size(float(self.settings.value("font_size", 11)))
+        ui_version = int(self.settings.value("ui_version", 0) or 0)
+        font_size = float(self.settings.value("font_size", DEFAULT_FONT_SIZE))
+        if ui_version < UI_VERSION and font_size < DEFAULT_FONT_SIZE:
+            font_size = DEFAULT_FONT_SIZE          # one-time upgrade to the larger default
+        self.editor.set_font_size(font_size)
 
         self._build_actions()
         self._build_menus()
@@ -1134,13 +1323,33 @@ class MainWindow(QMainWindow):
         self._set_dark(dark in (True, "true"), save=False)
 
         geo = self.settings.value("geometry")
-        if geo is not None:
+        self._needs_default_geometry = geo is None or ui_version < UI_VERSION
+        if not self._needs_default_geometry:
             self.restoreGeometry(geo)
         else:
-            self.resize(1200, 800)
+            avail = QApplication.primaryScreen().availableGeometry()
+            self.resize(max(avail.width() // 2, 400), avail.height())
+        self.settings.setValue("ui_version", UI_VERSION)
 
         if not (path and self.load_file(path)):
             self.new_file(ask=False)
+
+    def showEvent(self, e) -> None:
+        super().showEvent(e)
+        if self._needs_default_geometry:
+            self._needs_default_geometry = False
+            QTimer.singleShot(0, self._apply_default_geometry)
+
+    def _apply_default_geometry(self) -> None:
+        """First start: full screen height, half the screen width, centered."""
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        frame = self.frameGeometry()
+        extra_w = max(0, frame.width() - self.width())
+        extra_h = max(0, frame.height() - self.height())
+        w = avail.width() // 2
+        self.resize(max(w - extra_w, self.minimumSizeHint().width()), avail.height() - extra_h)
+        self.move(avail.x() + (avail.width() - self.frameGeometry().width()) // 2, avail.y())
 
     # ---- actions ---------------------------------------------------------
     def _act(self, text: str, slot, shortcut=None, tip: str = "") -> QAction:
@@ -1268,28 +1477,34 @@ class MainWindow(QMainWindow):
         m.addActions([self.a_shortcuts, self.a_about])
 
     def _build_toolbar(self) -> None:
+        # Row 1: file + folding of the whole document
         tb = QToolBar("Main")
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.addToolBar(tb)
-        labels = [
+        self._add_tool_buttons(tb, [
             (self.a_open, "Open"), (self.a_save, "Save"), None,
-            (self.a_collapse_all, "⊟ Collapse all"), (self.a_collapse_level, "− Level"),
-            (self.a_expand_level, "+ Level"), (self.a_expand_all, "⊞ Expand all"),
-        ]
-        self._add_tool_buttons(tb, labels)
+            (self.a_collapse_all, "Collapse all"), (self.a_collapse_level, "Collapse level"),
+            (self.a_expand_level, "Expand level"), (self.a_expand_all, "Expand all"), None,
+        ])
         self.level_spin = QSpinBox()
         self.level_spin.setPrefix("Levels: ")
         self.level_spin.setRange(0, 99)
         self.level_spin.setToolTip("How many levels of branches to show (Ctrl+1 … Ctrl+9)")
         self.level_spin.valueChanged.connect(self._level_spin_changed)
-        tb.addWidget(self.level_spin)
-        tb.addSeparator()
-        self._add_tool_buttons(tb, [
-            (self.a_add_sibling, "＋ Item"), (self.a_add_child, "↳ Sub-item"),
-            (self.a_edit, "✎ Edit"), (self.a_delete, "✕ Delete"), None,
-            (self.a_up, "↑"), (self.a_down, "↓"), (self.a_left, "←"), (self.a_right, "→"), None,
+        tb.addWidget(_captioned(self.level_spin, "Ctrl+1 … 9"))
+
+        # Row 2: editing branches
+        self.addToolBarBreak()
+        tb2 = QToolBar("Tree")
+        tb2.setObjectName("tree_toolbar")
+        tb2.setMovable(False)
+        self.addToolBar(tb2)
+        self._add_tool_buttons(tb2, [
+            (self.a_add_sibling, "Add item"), (self.a_add_child, "Add sub-item"),
+            (self.a_edit, "Edit"), (self.a_delete, "Delete"), None,
+            (self.a_up, "Move up"), (self.a_down, "Move down"),
+            (self.a_left, "Move left"), (self.a_right, "Move right"), None,
             (self.a_format, "Format"),
         ])
 
@@ -1299,11 +1514,20 @@ class MainWindow(QMainWindow):
                 tb.addSeparator()
                 continue
             action, label = item
-            btn = QToolButton()
-            btn.setDefaultAction(action)
-            btn.setText(label)
-            btn.setAutoRaise(True)
-            tb.addWidget(btn)
+            tb.addWidget(ActionButton(action, label))
+
+    def _refresh_icons(self, dark: bool) -> None:
+        color = "#c9ccd3" if dark else "#3b4048"
+        danger = "#e5737c" if dark else "#c0392b"
+        for action, kind in (
+                (self.a_open, "open"), (self.a_save, "save"),
+                (self.a_collapse_all, "collapse_all"), (self.a_collapse_level, "collapse_level"),
+                (self.a_expand_level, "expand_level"), (self.a_expand_all, "expand_all"),
+                (self.a_add_sibling, "add_item"), (self.a_add_child, "add_child"),
+                (self.a_edit, "edit"), (self.a_delete, "delete"),
+                (self.a_up, "up"), (self.a_down, "down"), (self.a_left, "left"),
+                (self.a_right, "right"), (self.a_format, "format")):
+            action.setIcon(make_icon(kind, danger if kind == "delete" else color))
 
     def _build_statusbar(self) -> None:
         sb = self.statusBar()
@@ -1469,12 +1693,13 @@ class MainWindow(QMainWindow):
 
     # ---- view ------------------------------------------------------------
     def _zoom(self, step: int) -> None:
-        size = 11 if step == 0 else self.editor.font_size() + step
+        size = DEFAULT_FONT_SIZE if step == 0 else self.editor.font_size() + step
         self.editor.set_font_size(size)
 
     def _set_dark(self, dark: bool, save: bool = True) -> None:
         apply_app_palette(QApplication.instance(), dark)
         self.editor.set_theme(Theme(dark))
+        self._refresh_icons(dark)
         self.a_dark.blockSignals(True)
         self.a_dark.setChecked(dark)
         self.a_dark.blockSignals(False)
@@ -1562,6 +1787,10 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("Nodeon")
+    ui_font = app.font()
+    if ui_font.pointSizeF() > 0:
+        ui_font.setPointSizeF(ui_font.pointSizeF() + 1)
+        app.setFont(ui_font)
     _install_excepthook()
     path = sys.argv[1] if len(sys.argv) > 1 else None
     win = MainWindow(path)
