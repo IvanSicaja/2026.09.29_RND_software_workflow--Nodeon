@@ -45,6 +45,8 @@ APP_NAME = "Nodeon"
 APP_VERSION = "1.0.0"
 COLLAPSED = 1                      # QTextBlock.userState() flag of a folded branch
 NEW_DOCUMENT = "new-project/\n│\n└── "
+# Shortcut for "Edit name & explanation". Change it here if you prefer another one.
+EDIT_SHORTCUT = "Ctrl+Shift+E"
 DEFAULT_FONT_SIZE = 12.0           # editor font size (pt)
 UI_VERSION = 2                     # bump to re-apply first-start layout defaults
 
@@ -1408,7 +1410,7 @@ class MainWindow(QMainWindow):
                                ["Ctrl+Return", "Ctrl+Enter"], "New item on the same level")
         self.a_add_child = A("Add sub-item", e.add_child,
                              ["Ctrl+Shift+Return", "Ctrl+Shift+Enter"], "New item inside this one")
-        self.a_edit = A("Edit name && explanation…", lambda: e.edit_current(), "F2")
+        self.a_edit = A("Edit name && explanation…", lambda: e.edit_current(), EDIT_SHORTCUT)
         self.a_explain = A("Edit explanation…", lambda: e.edit_current(True), "Ctrl+E")
         self.a_duplicate = A("Duplicate branch", e.duplicate, "Ctrl+D")
         self.a_delete = A("Delete branch", e.delete_branch, "Ctrl+Shift+Delete",
@@ -1502,10 +1504,10 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb2)
         self._add_tool_buttons(tb2, [
             (self.a_add_sibling, "Add item"), (self.a_add_child, "Add sub-item"),
-            (self.a_edit, "Edit"), (self.a_delete, "Delete"), None,
+            (self.a_edit, "Edit"), None,
             (self.a_up, "Move up"), (self.a_down, "Move down"),
             (self.a_left, "Move left"), (self.a_right, "Move right"), None,
-            (self.a_format, "Format"),
+            (self.a_format, "Format"), (self.a_delete, "Delete"),
         ])
 
     def _add_tool_buttons(self, tb: QToolBar, items) -> None:
@@ -1732,7 +1734,7 @@ class MainWindow(QMainWindow):
             ("New sub-item", "Ctrl+Shift+Enter"),
             ("Move right / left one level", "Tab / Shift+Tab  (or Alt+Shift+→ / ←)"),
             ("Move up / down", "Alt+Shift+↑ / ↓"),
-            ("Edit name & explanation", "F2  (explanation only: Ctrl+E)"),
+            ("Edit name & explanation", f"{EDIT_SHORTCUT}  (explanation only: Ctrl+E)"),
             ("Duplicate / delete branch", "Ctrl+D / Ctrl+Shift+Delete"),
             ("Remove an empty new item", "Backspace"),
             ("Format document", "Ctrl+Alt+L  (also on save)"),
