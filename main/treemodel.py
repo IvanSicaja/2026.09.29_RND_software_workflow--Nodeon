@@ -55,7 +55,7 @@ class TreeError(Exception):
 # Model
 # --------------------------------------------------------------------------- #
 class Node:
-    __slots__ = ("name", "comment", "children", "parent", "gap_before")
+    __slots__ = ("name", "comment", "children", "parent", "gap_before", "comment_col")
 
     def __init__(self, name: str = "", comment: Optional[List[str]] = None,
                  gap_before: int = 0) -> None:
@@ -64,6 +64,8 @@ class Node:
         self.children: List["Node"] = []
         self.parent: Optional["Node"] = None
         self.gap_before: int = gap_before
+        # Column of the "#" as it appears in the text (None = not placed yet).
+        self.comment_col: Optional[int] = None
 
     def __repr__(self) -> str:
         return f"Node({self.name!r}, children={len(self.children)})"
@@ -122,11 +124,13 @@ class Node:
 
     def clone(self) -> "Node":
         new = Node(self.name, self.comment, self.gap_before)
+        new.comment_col = self.comment_col
         stack = [(self, new)]
         while stack:
             src, dst = stack.pop()
             for c in src.children:
                 cc = Node(c.name, c.comment, c.gap_before)
+                cc.comment_col = c.comment_col
                 dst.append_child(cc)
                 stack.append((c, cc))
         return new
@@ -235,6 +239,16 @@ def _lead(line: str) -> int:
     return i
 
 
+def _hash_index(content: str) -> int:
+    """Index of the "#" that starts the explanation in content (-1 if none)."""
+    stripped = content.lstrip()
+    offset = len(content) - len(stripped)
+    if stripped.startswith("#"):
+        return offset
+    m = _COMMENT_SPLIT_RE.search(stripped)
+    return offset + m.start() + 1 if m else -1
+
+
 def _split_name(content: str) -> Tuple[str, List[str]]:
     content = content.strip()
     if content.startswith("#"):
@@ -268,6 +282,7 @@ def parse(text: str) -> Tuple[TreeDocument, LineMap]:
         if m is not None:
             depth = (lead + INDENT // 2) // INDENT + 1
             content = line[m.end():]
+            cstart = m.end()
             ncol = m.end() + (len(content) - len(content.lstrip(" ")))
         else:
             rest = line[lead:]
@@ -283,11 +298,13 @@ def parse(text: str) -> Tuple[TreeDocument, LineMap]:
                     kinds[i] = KIND_PREAMBLE
                 continue
             depth = 0 if lead == 0 else max(1, (lead + INDENT // 2) // INDENT)
-            content, ncol = rest, lead
+            content, ncol, cstart = rest, lead, lead
 
         depth = min(depth, len(stack) - 1)
         name, comment = _split_name(content)
         node = Node(name, comment, gap_before=len(pending))
+        if comment:
+            node.comment_col = cstart + _hash_index(content)
         for j in pending:
             nodes[j] = node
         pending = []
@@ -311,7 +328,39 @@ def _with_comment(first: str, col: int, text: str) -> str:
     return first + " " * pad + ("# " + text if text else "#")
 
 
-def render(doc: TreeDocument, opts: Optional[FormatOptions] = None) -> Tuple[str, LineMap]:
+def first_line_length(node: Node) -> int:
+    """Length of "prefix + connector + name" of the node's line."""
+    d = node.depth
+    return len(node.name) if d <= 0 else INDENT * d + len(node.name)
+
+
+def comment_min_col(node: Node, gap: int) -> int:
+    """Leftmost allowed "#" column: `gap` spaces after the longest text on any
+    line of the node's explanation (the name line or the continuation guides)."""
+    d = node.depth
+    longest = first_line_length(node)
+    if len(node.comment) > 1:
+        cont = (INDENT * d if d > 0 else 0) + (1 if node.children else 0)
+        longest = max(longest, cont)
+    return longest + gap
+
+
+def _most_common(values: List[int]) -> int:
+    counts: Dict[int, int] = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    return max(counts, key=lambda v: (counts[v], v))
+
+
+def render(doc: TreeDocument, opts: Optional[FormatOptions] = None,
+           preserve_columns: bool = False) -> Tuple[str, LineMap]:
+    """Render the canonical text.
+
+    preserve_columns=False: explanations of consecutive siblings are aligned
+    automatically (Format document).
+    preserve_columns=True: every explanation keeps its current column and is
+    only pushed right when its own text would touch it; new explanations join
+    the column used by their siblings."""
     opts = opts or FormatOptions()
     out: List[str] = []
     kinds: List[str] = []
@@ -341,8 +390,17 @@ def render(doc: TreeDocument, opts: Optional[FormatOptions] = None) -> Tuple[str
         for i in range(1, len(kids) + 1):
             if i == len(kids) or kids[i].gap_before > 0:
                 col = max(opts.min_comment_column, max(lens[start:i]) + opts.comment_gap)
-                for j in range(start, i):
-                    cols[j] = col
+                if preserve_columns:
+                    block = kids[start:i]
+                    placed = [k.comment_col for k in block
+                              if k.comment and k.comment_col is not None]
+                    base = _most_common(placed) if placed else col
+                    for j, k in enumerate(block, start):
+                        own = k.comment_col if (k.comment and k.comment_col is not None) else base
+                        cols[j] = max(own, comment_min_col(k, opts.comment_gap))
+                else:
+                    for j in range(start, i):
+                        cols[j] = col
                 start = i
         for k, col in reversed(list(zip(kids, cols))):
             stack.append((k, prefix, col))
@@ -362,6 +420,8 @@ def render(doc: TreeDocument, opts: Optional[FormatOptions] = None) -> Tuple[str
             ncol = len(prefix) + INDENT
         header[id(node)] = len(out)
         name_col[id(node)] = ncol
+        if node.comment:
+            node.comment_col = max(col, len(first) + 1)
         emit(_with_comment(first, col, node.comment[0]) if node.comment else first,
              KIND_NODE, node)
         if len(node.comment) > 1:
@@ -478,3 +538,37 @@ def previous_in_order(doc: TreeDocument, node: Node) -> Optional[Node]:
             return prev
         prev = n
     return None
+
+
+def shift_comments(nodes: List[Node], direction: int, gap: int) -> int:
+    """Move the explanations of `nodes` one column left (-1) or right (+1).
+
+    Rules:
+    * Every explanation keeps at least `gap` spaces after the text of its line.
+    * Moving right: the leftmost explanations move first until they reach the
+      others, so explanations always end up in one vertical column; when all
+      are aligned they move right together.
+    * Moving left: the rightmost explanations that can still move go one
+      column left; explanations that reach their text stop there, all the
+      others stay aligned with each other.
+
+    Returns the new alignment column. Raises TreeError if nothing can move.
+    """
+    units = [n for n in nodes if n.comment]
+    if not units:
+        raise TreeError("No explanations (#) in the selection")
+    mins = {id(n): comment_min_col(n, gap) for n in units}
+    cur = {id(n): max(n.comment_col if n.comment_col is not None else 0, mins[id(n)])
+           for n in units}
+    if direction > 0:
+        target = min(cur.values()) + 1
+        for n in units:
+            n.comment_col = max(cur[id(n)], target)
+        return target
+    movable = [cur[id(n)] for n in units if cur[id(n)] > mins[id(n)]]
+    if not movable:
+        raise TreeError("Explanations are already as close to the text as possible")
+    target = max(movable) - 1
+    for n in units:
+        n.comment_col = max(min(cur[id(n)], target), mins[id(n)])
+    return target

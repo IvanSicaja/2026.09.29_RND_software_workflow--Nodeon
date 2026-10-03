@@ -484,12 +484,16 @@ class TreeEditor(QPlainTextEdit):
         return line, node, offset
 
     def run_op(self, op: Callable[[Optional[tm.Node]], Tuple[Optional[tm.Node], str]],
-               require_node: bool = True, message: str = "") -> bool:
+               require_node: bool = True, message: str = "",
+               canonical: bool = False) -> bool:
         """Apply a model operation, re-render the text (one undo step) and
         keep folds, scroll position and cursor where the user expects them.
 
         op(node) returns (focus_node, mode) where mode is
-        'keep' | 'start' | 'end' | 'select'."""
+        'keep' | 'start' | 'end' | 'select'.
+
+        canonical=True re-aligns all explanations automatically (Format
+        document); otherwise explanations keep the columns the user chose."""
         self.ensure_parsed()
         _, node, offset = self._cursor_context()
         if require_node and node is None:
@@ -503,7 +507,7 @@ class TreeEditor(QPlainTextEdit):
             self.statusMessage.emit(str(ex))
             return False
 
-        text, lm = tm.render(self._model, self.options)
+        text, lm = tm.render(self._model, self.options, preserve_columns=not canonical)
         self._replace_text(text)
         self._model, self._map = lm.doc, lm
         self._ranges = lm.fold_ranges()
@@ -601,9 +605,60 @@ class TreeEditor(QPlainTextEdit):
     def duplicate(self) -> None:
         self.run_op(lambda n: (tm.duplicate(n), "end"), message="Branch duplicated")
 
-    def format_document(self, quiet: bool = False) -> None:
+    def format_document(self, quiet: bool = False, canonical: bool = True) -> None:
+        """canonical=True: full auto-alignment (Ctrl+Alt+L).
+        canonical=False: tidy the tree lines but keep the explanation columns
+        (used when saving, so manual alignment is not lost)."""
         self.run_op(lambda n: (n, "keep"), require_node=False,
-                    message="" if quiet else "Document formatted")
+                    message="" if quiet else "Document formatted", canonical=canonical)
+
+    def shift_explanations(self, direction: int) -> None:
+        """Move explanations left (-1) / right (+1): the selected lines, or the
+        whole document when nothing is selected. The selection is kept so the
+        shortcut can be pressed repeatedly."""
+        self.ensure_parsed()
+        doc = self.document()
+        cur = self.textCursor()
+        anchor_b = doc.findBlock(cur.anchor())
+        pos_b = doc.findBlock(cur.position())
+        anchor = (anchor_b.blockNumber(), cur.anchor() - anchor_b.position())
+        pos = (pos_b.blockNumber(), cur.position() - pos_b.position())
+        whole = not cur.hasSelection()
+        if whole:
+            nodes = [n for n in self._model.iter_nodes() if n.comment]
+        else:
+            first, last = sorted((anchor[0], pos[0]))
+            # A selection ending at column 0 of a line does not include that line.
+            if last > first and (pos if pos[0] == last else anchor)[1] == 0:
+                last -= 1
+            seen: Set[int] = set()
+            nodes = []
+            for line in range(first, last + 1):
+                n = self._map.node_at(line)
+                if n is not None and n.comment and id(n) not in seen:
+                    seen.add(id(n))
+                    nodes.append(n)
+        gap = self.options.comment_gap
+        result = {}
+
+        def op(_node):
+            result["col"] = tm.shift_comments(nodes, direction, gap)
+            return None, "keep"
+
+        if not self.run_op(op, require_node=False):
+            return
+        # Restore the cursor/selection on the same lines.
+        new = QTextCursor(doc)
+
+        def to_pos(line_col: Tuple[int, int]) -> int:
+            b = doc.findBlockByNumber(min(line_col[0], doc.blockCount() - 1))
+            return b.position() + min(line_col[1], b.length() - 1)
+        new.setPosition(to_pos(anchor))
+        new.setPosition(to_pos(pos), QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(new)
+        scope = "whole document" if whole else f"{len(nodes)} explanation(s)"
+        side = "right" if direction > 0 else "left"
+        self.statusMessage.emit(f"Explanations moved {side} ({scope}) - column {result['col'] + 1}")
 
     def edit_current(self, focus_explanation: bool = False) -> None:
         self.ensure_parsed()
@@ -982,6 +1037,16 @@ def _draw_icon(p: QPainter, kind: str) -> None:
         }[kind]
         line(tail, head)
         line(wing1, head, wing2)
+    elif kind in ("expl_left", "expl_right"):           # explanation column + arrow
+        x0 = 13 if kind == "expl_left" else 3
+        for y in (6, 12, 18):
+            line((x0, y), (x0 + 8, y))
+        if kind == "expl_left":
+            line((10, 12), (3, 12))
+            line((6, 8.5), (2.5, 12), (6, 15.5))
+        else:
+            line((14, 12), (21, 12))
+            line((18, 8.5), (21.5, 12), (18, 15.5))
     elif kind == "format":                              # names + aligned explanations
         for y, x_end in ((6, 9), (12, 12), (18, 7)):
             line((4, y), (x_end, y))
@@ -1182,7 +1247,7 @@ class SettingsDialog(QDialog):
         self.gap = QSpinBox()
         self.gap.setRange(1, 40)
         self.gap.setValue(opts.comment_gap)
-        self.on_save = QCheckBox("Format the document every time it is saved")
+        self.on_save = QCheckBox("Tidy the tree lines every time it is saved (explanation columns are kept)")
         self.on_save.setChecked(format_on_save)
         form.addRow("Explanation '#' column (minimum)", self.min_col)
         form.addRow("Spaces between longest name and '#'", self.gap)
@@ -1410,7 +1475,8 @@ class MainWindow(QMainWindow):
                                ["Ctrl+Return", "Ctrl+Enter"], "New item on the same level")
         self.a_add_child = A("Add sub-item", e.add_child,
                              ["Ctrl+Shift+Return", "Ctrl+Shift+Enter"], "New item inside this one")
-        self.a_edit = A("Edit name && explanation…", lambda: e.edit_current(), EDIT_SHORTCUT)
+        self.a_edit = A("Edit name && explanation…", lambda: e.edit_current(), EDIT_SHORTCUT,
+                        "Explanation – add or edit the explanation (and the name)")
         self.a_explain = A("Edit explanation…", lambda: e.edit_current(True), "Ctrl+E")
         self.a_duplicate = A("Duplicate branch", e.duplicate, "Ctrl+D")
         self.a_delete = A("Delete branch", e.delete_branch, "Ctrl+Shift+Delete",
@@ -1423,6 +1489,12 @@ class MainWindow(QMainWindow):
                          "Into the item above (also Tab)")
         self.a_format = A("Format document", lambda: e.format_document(), "Ctrl+Alt+L",
                           "Re-draw all lines and align every explanation")
+        self.a_expl_left = A("Move explanations left", lambda: e.shift_explanations(-1),
+                             "Alt+Left", "Move explanations (#) left - selected lines, or the "
+                             "whole document if nothing is selected")
+        self.a_expl_right = A("Move explanations right", lambda: e.shift_explanations(1),
+                              "Alt+Right", "Move explanations (#) right - selected lines, or the "
+                              "whole document if nothing is selected")
 
         self.a_zoom_in = A("Zoom in", lambda: self._zoom(1), ["Ctrl+=", "Ctrl++"])
         self.a_zoom_out = A("Zoom out", lambda: self._zoom(-1), "Ctrl+-")
@@ -1461,7 +1533,7 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addActions([self.a_up, self.a_down, self.a_left, self.a_right])
         m.addSeparator()
-        m.addAction(self.a_format)
+        m.addActions([self.a_expl_left, self.a_expl_right, self.a_format])
 
         m = mb.addMenu("&View")
         m.addActions([self.a_collapse_all, self.a_collapse_level, self.a_expand_level,
@@ -1495,6 +1567,10 @@ class MainWindow(QMainWindow):
         self.level_spin.setToolTip("How many levels of branches to show (Ctrl+1 … Ctrl+9)")
         self.level_spin.valueChanged.connect(self._level_spin_changed)
         tb.addWidget(_captioned(self.level_spin, "Ctrl+1 … 9"))
+        tb.addSeparator()
+        self._add_tool_buttons(tb, [
+            (self.a_expl_left, "Explanations ←"), (self.a_expl_right, "Explanations →"),
+        ])
 
         # Row 2: editing branches
         self.addToolBarBreak()
@@ -1504,7 +1580,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb2)
         self._add_tool_buttons(tb2, [
             (self.a_add_sibling, "Add item"), (self.a_add_child, "Add sub-item"),
-            (self.a_edit, "Edit"), None,
+            (self.a_edit, "Explanation"), None,
             (self.a_up, "Move up"), (self.a_down, "Move down"),
             (self.a_left, "Move left"), (self.a_right, "Move right"), None,
             (self.a_format, "Format"), (self.a_delete, "Delete"),
@@ -1528,7 +1604,8 @@ class MainWindow(QMainWindow):
                 (self.a_add_sibling, "add_item"), (self.a_add_child, "add_child"),
                 (self.a_edit, "edit"), (self.a_delete, "delete"),
                 (self.a_up, "up"), (self.a_down, "down"), (self.a_left, "left"),
-                (self.a_right, "right"), (self.a_format, "format")):
+                (self.a_right, "right"), (self.a_format, "format"),
+                (self.a_expl_left, "expl_left"), (self.a_expl_right, "expl_right")):
             action.setIcon(make_icon(kind, danger if kind == "delete" else color))
 
     def _build_statusbar(self) -> None:
@@ -1646,7 +1723,7 @@ class MainWindow(QMainWindow):
 
     def _write(self, path: str) -> bool:
         if self.format_on_save:
-            self.editor.format_document(quiet=True)
+            self.editor.format_document(quiet=True, canonical=False)
         text = self.editor.toPlainText()
         data = (text.replace("\n", self.newline) + self.newline).encode("utf-8")
         f = QSaveFile(path)            # atomic: writes a temp file, then renames
@@ -1737,7 +1814,8 @@ class MainWindow(QMainWindow):
             ("Edit name & explanation", f"{EDIT_SHORTCUT}  (explanation only: Ctrl+E)"),
             ("Duplicate / delete branch", "Ctrl+D / Ctrl+Shift+Delete"),
             ("Remove an empty new item", "Backspace"),
-            ("Format document", "Ctrl+Alt+L  (also on save)"),
+            ("Move explanations left / right", "Alt+← / Alt+→  (selection, or whole document)"),
+            ("Format document (auto-align all)", "Ctrl+Alt+L  (saving tidies lines, keeps # columns)"),
             ("Find", "Ctrl+F, F3, Shift+F3"),
             ("Raw newline (no auto item)", "Shift+Enter"),
         ]
