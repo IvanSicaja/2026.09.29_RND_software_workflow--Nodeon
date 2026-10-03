@@ -1,4 +1,4 @@
-"""GUI tests for main/Nodeon.py (runs headless, no window appears).
+"""GUI tests for main/main.py (the Nodeon app) (runs headless, no window appears).
 
 Run from the project root:
     python -m unittest discover tests
@@ -23,7 +23,13 @@ except ImportError:                                     # pragma: no cover
     QApplication = None
 
 if QApplication is not None:
-    import Nodeon as app_module
+    import importlib.util
+    # Load main/main.py by its path: the name "main" alone could be confused
+    # with the main/ folder itself.
+    _spec = importlib.util.spec_from_file_location(
+        "nodeon_app", os.path.join(PROJECT_ROOT, "main", "main.py"))
+    app_module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(app_module)
     import treemodel as tm
 
 M = Qt.KeyboardModifier if QApplication is not None else None

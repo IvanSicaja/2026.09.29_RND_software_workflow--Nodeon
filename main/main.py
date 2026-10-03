@@ -2,9 +2,9 @@
 """
 Nodeon - a plain-.txt editor for box-drawing structure trees.
 
-    python main/Nodeon.py [file.txt]
+    python main/main.py [file.txt]
 
-Nodeon.py (this file) is the application; it needs treemodel.py next to it.
+main.py (this file) is the Nodeon application; it needs treemodel.py next to it.
 
 The file on disk is always pure UTF-8 text in this format:
 
