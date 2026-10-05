@@ -732,3 +732,31 @@ def resolve_span(span: Span, seg_text: str) -> Optional[Span]:
     if best is None:
         return None
     return (seg, best, best + len(text), mark, text)
+
+
+# A "word" for colouring at the cursor: letters, digits and joined symbols such
+# as 01_media/, README.md or non-code; spaces and brackets/punctuation split.
+_WORD_RE = re.compile(r"[^\s,;:!?()\[\]{}<>\"“”‘’«»]+")
+
+
+def word_at(text: str, pos: int) -> Optional[Tuple[int, int]]:
+    """(start, end) of the word at cursor position `pos` in `text`, or None
+    when the cursor is not touching a word. Inside a word wins; at a border
+    the word on the left is preferred (like most editors)."""
+    if not 0 <= pos <= len(text):
+        return None
+    left = right = None
+    for m in _WORD_RE.finditer(text):
+        s, e = m.start(), m.end()
+        full_end = e
+        while e > s + 1 and text[e - 1] == "." and "." not in text[s:e - 1]:
+            e -= 1                                   # "etc." -> "etc", "costs." -> "costs"
+        if s < pos < e:
+            return s, e
+        if pos in (e, full_end):
+            left = (s, e)
+        elif s == pos and right is None:
+            right = (s, e)
+        if s > pos:
+            break
+    return left or right

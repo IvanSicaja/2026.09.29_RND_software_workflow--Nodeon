@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBo
 REQUIRED_MODEL_NAMES = ("FormatOptions", "Node", "TreeDocument", "TreeError", "parse",
                         "render", "format_text", "shift_comments", "insert_spacer",
                         "node_after_subtree", "node_keys", "line_segments", "add_span",
-                        "subtract_range", "is_covered", "resolve_span")
+                        "subtract_range", "is_covered", "resolve_span", "word_at")
 
 
 class ModelLoadError(Exception):
@@ -937,12 +937,16 @@ class TreeEditor(QPlainTextEdit):
         tree lines are never coloured). Same colour again removes it."""
         self.ensure_parsed()
         cur = self.textCursor()
-        if not cur.hasSelection():
-            self.statusMessage.emit("Select the words to colour first "
-                                    "(Alt+G / O / R colour the whole name)")
-            return
         doc = self.document()
-        a, b = sorted((cur.anchor(), cur.position()))
+        if not cur.hasSelection():
+            word = self._word_at_cursor()
+            if word is None:
+                self.statusMessage.emit("No word at the cursor - put the cursor on a word "
+                                        "or select text")
+                return
+            a, b = word
+        else:
+            a, b = sorted((cur.anchor(), cur.position()))
         first, last = doc.findBlock(a).blockNumber(), doc.findBlock(b).blockNumber()
         keys = tm.node_keys(self._model)
         numbers = self._comment_numbers()
@@ -971,9 +975,26 @@ class TreeEditor(QPlainTextEdit):
             else:
                 self.spans.pop(key, None)
         self._resolve_spans()
-        self.statusMessage.emit(f"Selected text: {MARK_LABELS[mark]}" if mark
-                                else "Selected text: colour removed")
+        what = "Selected text" if cur.hasSelection() else "Word at cursor"
+        self.statusMessage.emit(f"{what}: {MARK_LABELS[mark]}" if mark
+                                else f"{what}: colour removed")
         self.marksChanged.emit()
+
+    def _word_at_cursor(self) -> Optional[Tuple[int, int]]:
+        """Document positions (start, end) of the word at the cursor, inside a
+        name or explanation only; None on spaces, tree lines or '#'."""
+        cur = self.textCursor()
+        block = cur.block()
+        line = block.blockNumber()
+        text = block.text()
+        col = u16_to_cp(text, cur.positionInBlock())
+        for _node, _seg, s, e, _bold in self._line_segments(line, text, self._comment_numbers()):
+            if s <= col <= e:
+                w = tm.word_at(text[s:e], col - s)
+                if w is not None:
+                    pos = block.position()
+                    return pos + u16len(text[:s + w[0]]), pos + u16len(text[:s + w[1]])
+        return None
 
     def export_spans(self) -> List[Tuple[tm.NodeKey, tm.Span]]:
         self.ensure_parsed()
@@ -1528,6 +1549,43 @@ def make_dots_icon(colors: List[str]) -> QIcon:
     return icon
 
 
+def make_mark_icon(kind: str, colors: List[str], neutral: str) -> QIcon:
+    """'line': three full coloured bars (whole name coloured).
+    'words': three text lines where only one word per line is coloured."""
+    icon = QIcon()
+    for size in (16, 20, 24, 32, 48, 64):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.scale(size / 24.0, size / 24.0)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        def bar(x1: float, x2: float, y: float, color: str) -> None:
+            pen = QPen(QColor(color), 3.2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.drawLine(QPointF(x1, y), QPointF(x2, y))
+
+        rows = (5.5, 12.0, 18.5)
+        if kind == "line":
+            for y, c in zip(rows, colors):
+                bar(3.5, 20.5, y, c)
+        else:
+            layout = ((3.5, 7.0, 10.5, 15.5, 19.0, 20.5),   # grey | colour | grey
+                      (3.5, 3.5, 6.5, 12.5, 16.0, 20.5),
+                      (3.5, 9.5, 13.0, 17.5, 21.0, 21.0))
+            for y, c, (g1, g2, w1, w2, g3, g4) in zip(rows, colors, layout):
+                if g2 > g1:
+                    bar(g1, g2, y, neutral)
+                bar(w1, w2, y, c)
+                if g4 > g3:
+                    bar(g3, g4, y, neutral)
+        p.end()
+        icon.addPixmap(pm)
+    return icon
+
+
 def make_icon(kind: str, color: str) -> QIcon:
     icon = QIcon()
     for size in (16, 20, 24, 32, 48, 64):
@@ -1609,9 +1667,9 @@ class ActionButton(QToolButton):
         fm = QFontMetrics(self.font())
         sm = QFontMetrics(_caption_font(self.font()))
         w = max(fm.horizontalAdvance(self._label), sm.horizontalAdvance(self._keys()),
-                self.ICON) + 18
+                self.ICON) + 12
         h = 5 + self.ICON + 4 + fm.height() + 1 + sm.height() + 5
-        return QSize(max(w, 58), h)
+        return QSize(max(w, 52), h)
 
     def minimumSizeHint(self) -> QSize:
         return self.sizeHint()
@@ -1987,29 +2045,34 @@ class MainWindow(QMainWindow):
                                 "(press again to remove)")
         self.a_mark_clear = A("Remove mark", lambda: e.mark_selection(MARK_NONE), "Alt+C",
                               "Remove the colour mark from the name")
-        self.a_word_checked = A("Colour selected text: checked", lambda: e.mark_words(MARK_CHECKED),
-                                "Alt+Shift+G", "Colour only the selected characters green "
-                                "(press again to remove)")
-        self.a_word_explore = A("Colour selected text: to explore",
+        self.a_word_checked = A("Colour word / selection: checked",
+                                lambda: e.mark_words(MARK_CHECKED), "Alt+Shift+G",
+                                "Colour the word at the cursor (or the selected characters) "
+                                "green - press again to remove")
+        self.a_word_explore = A("Colour word / selection: to explore",
                                 lambda: e.mark_words(MARK_EXPLORE), "Alt+Shift+O",
-                                "Colour only the selected characters orange "
-                                "(press again to remove)")
-        self.a_word_problem = A("Colour selected text: problem",
+                                "Colour the word at the cursor (or the selected characters) "
+                                "orange - press again to remove")
+        self.a_word_problem = A("Colour word / selection: problem",
                                 lambda: e.mark_words(MARK_PROBLEM), "Alt+Shift+R",
-                                "Colour only the selected characters red "
-                                "(press again to remove)")
-        self.a_word_clear = A("Remove colour from selected text", lambda: e.mark_words(MARK_NONE),
-                              "Alt+Shift+C", "Remove the colour from the selected characters")
+                                "Colour the word at the cursor (or the selected characters) "
+                                "red - press again to remove")
+        self.a_word_clear = A("Remove colour from word / selection",
+                              lambda: e.mark_words(MARK_NONE), "Alt+Shift+C",
+                              "Remove the colour from the word at the cursor "
+                              "(or the selected characters)")
         self.mark_actions = [self.a_mark_checked, self.a_mark_explore, self.a_mark_problem,
                              self.a_mark_clear]
         self.word_actions = [self.a_word_checked, self.a_word_explore, self.a_word_problem,
                              self.a_word_clear]
-        self.a_mark_menu = QAction("Mark", self)
-        self.a_mark_menu.setToolTip("Mark branch names (selected lines or the line at the "
-                                    "cursor): Checked Alt+G · To explore Alt+O · "
-                                    "Problem Alt+R · Remove Alt+C\n"
-                                    "Colour only the selected text: add Shift "
-                                    "(Alt+Shift+G / O / R / C)")
+        self.a_mark_menu = QAction("Mark line", self)
+        self.a_mark_menu.setToolTip("Mark line - colour the whole branch name (line at the "
+                                    "cursor or selected lines):\nChecked Alt+G · To explore "
+                                    "Alt+O · Problem Alt+R · Remove Alt+C")
+        self.a_words_menu = QAction("Mark words", self)
+        self.a_words_menu.setToolTip("Mark words - colour only the word at the cursor or the "
+                                     "selected characters:\nChecked Alt+Shift+G · To explore "
+                                     "Alt+Shift+O · Problem Alt+Shift+R · Remove Alt+Shift+C")
 
         self.a_zoom_in = A("Zoom in", lambda: self._zoom(1), ["Ctrl+=", "Ctrl++"])
         self.a_zoom_out = A("Zoom out", lambda: self._zoom(-1), "Ctrl+-")
@@ -2094,13 +2157,16 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         self.mark_menu = QMenu(self)
         self.mark_menu.addActions(self.mark_actions)
-        self.mark_menu.addSeparator()
-        self.mark_menu.addActions(self.word_actions)
-        mark_btn = ActionButton(self.a_mark_menu, "Mark", caption="Alt+G / O / R")
-        mark_btn.setMenu(self.mark_menu)
-        mark_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        mark_btn.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
-        tb.addWidget(mark_btn)
+        self.words_menu = QMenu(self)
+        self.words_menu.addActions(self.word_actions)
+        for action, label, caption, menu in (
+                (self.a_mark_menu, "Mark line", "Alt+G/O/R", self.mark_menu),
+                (self.a_words_menu, "Mark words", "Alt+Shift+G/O/R", self.words_menu)):
+            btn = ActionButton(action, label, caption=caption)
+            btn.setMenu(menu)
+            btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            btn.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
+            tb.addWidget(btn)
 
         # Row 2: editing branches
         self.addToolBarBreak()
@@ -2148,8 +2214,9 @@ class MainWindow(QMainWindow):
         self.a_word_explore.setIcon(make_dots_icon([theme.mark_explore]))
         self.a_word_problem.setIcon(make_dots_icon([theme.mark_problem]))
         self.a_word_clear.setIcon(make_dots_icon([theme.guide]))
-        self.a_mark_menu.setIcon(make_dots_icon(
-            [theme.mark_checked, theme.mark_explore, theme.mark_problem]))
+        marks3 = [theme.mark_checked, theme.mark_explore, theme.mark_problem]
+        self.a_mark_menu.setIcon(make_mark_icon("line", marks3, theme.guide))
+        self.a_words_menu.setIcon(make_mark_icon("words", marks3, theme.guide))
 
     def _build_statusbar(self) -> None:
         sb = self.statusBar()
@@ -2422,7 +2489,8 @@ class MainWindow(QMainWindow):
             ("Colour marks (names only)", ""),
             ("Checked (green) / To explore (orange)", "Alt+G / Alt+O"),
             ("Problem (red) / Remove mark", "Alt+R / Alt+C  (same key again also removes)"),
-            ("Colour only the selected text", "Alt+Shift+G / O / R,  remove: Alt+Shift+C"),
+            ("Colour the word at the cursor or the selection",
+             "Alt+Shift+G / O / R,  remove: Alt+Shift+C"),
             ("Move right / left one level", "Tab / Shift+Tab  (or Alt+Shift+→ / ←)"),
             ("Move up / down", "Alt+Shift+↑ / ↓"),
             ("Edit name & explanation", f"{EDIT_SHORTCUT}  (explanation only: Ctrl+E)"),

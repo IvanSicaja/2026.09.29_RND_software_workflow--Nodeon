@@ -383,10 +383,20 @@ class GuiTests(unittest.TestCase):
 
     def test_mark_toolbar_and_shortcut_texts(self):
         labels = {b._label: b for b in self.win.findChildren(app_module.ActionButton)}
-        self.assertIn("Mark", labels)
-        self.assertEqual(labels["Mark"]._keys(), "Alt+G / O / R")
-        menu = [a for a in labels["Mark"].menu().actions() if not a.isSeparator()]
-        self.assertEqual(len(menu), 8)
+        self.assertIn("Mark line", labels)
+        self.assertIn("Mark words", labels)
+        self.assertEqual(labels["Mark line"]._keys(), "Alt+G/O/R")
+        self.assertEqual(labels["Mark words"]._keys(), "Alt+Shift+G/O/R")
+        self.assertEqual(labels["Mark line"].menu().actions(), self.win.mark_actions)
+        self.assertEqual(labels["Mark words"].menu().actions(), self.win.word_actions)
+        self.assertEqual([app_module.shortcut_text(a) for a in self.win.word_actions],
+                         ["Alt+Shift+G", "Alt+Shift+O", "Alt+Shift+R", "Alt+Shift+C"])
+        # two different icons
+        img1 = labels["Mark line"].defaultAction().icon().pixmap(24, 24).toImage()
+        img2 = labels["Mark words"].defaultAction().icon().pixmap(24, 24).toImage()
+        self.assertFalse(img1.isNull())
+        self.assertFalse(img2.isNull())
+        self.assertNotEqual(img1, img2)
         self.assertEqual([app_module.shortcut_text(a) for a in self.win.mark_actions],
                          ["Alt+G", "Alt+O", "Alt+R", "Alt+C"])
 
@@ -466,11 +476,89 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(set(self.colors_of(2, "Source")), {self.c("mark_checked")})
         self.assertEqual(set(self.colors_of(2, "code")), {self.c("comment")})
 
-    def test_word_needs_selection(self):
-        self.goto(2)
+    def test_word_nothing_on_tree_lines_or_spaces(self):
+        before = self.ed.textCursor().position()
+        self.goto(2)                                           # column 0: "├──"
         self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
-        self.assertIn("Select the words", self.win.statusBar().currentMessage())
+        self.assertIn("No word at the cursor", self.win.statusBar().currentMessage())
+        self.cursor_at(2, "                  # Source", 5)  # in the spaces before "#"
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.goto(1)                                           # spacer line "│"
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
         self.assertEqual(self.ed.export_spans(), [])
+        self.assertTrue(before >= 0)
+
+    # word at the cursor (no selection) --------------------------------------
+    def cursor_at(self, line, text, offset):
+        b = self.ed.document().findBlockByNumber(line)
+        cur = QTextCursor(b)
+        cur.setPosition(b.position() + b.text().index(text) + offset)
+        self.ed.setTextCursor(cur)
+
+    def test_cursor_inside_word_colours_that_word(self):
+        self.cursor_at(2, "Source", 3)                         # Sou|rce
+        pos = self.ed.textCursor().position()
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(2, "Source")), {self.c("mark_checked")})
+        self.assertEqual(set(self.colors_of(2, " code")), {self.c("comment")})
+        self.assertEqual(self.ed.textCursor().position(), pos)    # cursor not moved
+        self.assertFalse(self.ed.textCursor().hasSelection())
+        self.assertIn("Word at cursor", self.win.statusBar().currentMessage())
+
+    def test_cursor_at_word_borders(self):
+        self.cursor_at(2, "code", 4)                           # code| (end of line)
+        self.key(K.Key_O, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(2, "code")), {self.c("mark_explore")})
+        self.assertEqual(set(self.colors_of(2, "Source")), {self.c("comment")})
+        self.cursor_at(3, "Entry", 0)                          # |Entry
+        self.key(K.Key_R, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(3, "Entry")), {self.c("mark_problem")})
+        self.assertEqual(set(self.colors_of(3, "point")), {self.c("comment")})
+
+    def test_cursor_in_name(self):
+        self.cursor_at(4, "a_really_long_module_name.py", 6)
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(4, "a_really_long_module_name.py")),
+                         {self.c("mark_checked")})
+        self.assertEqual(set(self.colors_of(4, "Long")), {self.c("comment")})
+
+    def test_cursor_on_continuation_line(self):
+        self.cursor_at(6, "second", 2)
+        self.key(K.Key_R, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(6, "second")), {self.c("mark_problem")})
+        self.assertEqual(set(self.colors_of(6, "line")), {self.c("comment")})
+
+    def test_cursor_toggle_and_remove(self):
+        self.cursor_at(7, "Overview", 2)
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)     # same again = remove
+        self.assertEqual(set(self.colors_of(7, "Overview")), {self.c("comment")})
+        self.key(K.Key_O, M.AltModifier | M.ShiftModifier)
+        self.key(K.Key_R, M.AltModifier | M.ShiftModifier)     # recolour
+        self.assertEqual(set(self.colors_of(7, "Overview")), {self.c("mark_problem")})
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)     # remove
+        self.assertEqual(set(self.colors_of(7, "Overview")), {self.c("comment")})
+        self.assertEqual(self.ed.export_spans(), [])
+
+    def test_cursor_word_recolours_partly_coloured_word(self):
+        self.select(2, "Sour")
+        self.key(K.Key_O, M.AltModifier | M.ShiftModifier)
+        self.cursor_at(2, "Source", 5)
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(2, "Source")), {self.c("mark_checked")})
+
+    def test_cursor_word_saved(self):
+        self.cursor_at(5, "Documentation", 4)
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        with open(self.path + ".marks.json", encoding="utf-8") as f:
+            data = __import__("json").load(f)
+        self.assertEqual([w["text"] for w in data["words"]], ["Documentation"])
+
+    def test_selection_still_wins_over_word(self):
+        self.select(2, "urce co")                               # crosses two words
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(2, "urce co")), {self.c("mark_checked")})
+        self.assertEqual(set(self.colors_of(2, "So")), {self.c("comment")})
 
     def test_word_and_line_mark_together(self):
         self.mark(2, K.Key_R)                                  # whole name red

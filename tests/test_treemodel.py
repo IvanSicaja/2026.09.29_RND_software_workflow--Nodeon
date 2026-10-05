@@ -278,5 +278,36 @@ class WordSpans(unittest.TestCase):
         self.assertIsNone(tm.resolve_span(sp, "the medi_a x"))
 
 
+
+class WordAtCursor(unittest.TestCase):
+    T = "Additional project resources (non-code), etc. costs."
+
+    def w(self, pos, text=None):
+        text = self.T if text is None else text
+        r = tm.word_at(text, pos)
+        return text[r[0]:r[1]] if r else None
+
+    def test_inside_and_borders(self):
+        self.assertEqual(self.w(3), "Additional")           # inside
+        self.assertEqual(self.w(0), "Additional")           # at the start
+        self.assertEqual(self.w(10), "Additional")          # right after (left wins)
+        self.assertEqual(self.w(11), "project")             # at the start of the next
+        self.assertEqual(self.w(33), "non-code")            # inside brackets, with hyphen
+
+    def test_punctuation_and_dots(self):
+        self.assertEqual(self.w(43), "etc")                 # "etc." without the dot
+        self.assertEqual(self.w(45), "etc")                 # cursor after the dot
+        self.assertEqual(self.w(len(self.T)), "costs")      # end of line after "costs."
+        self.assertEqual(self.w(4, "README.md"), "README.md")
+        self.assertEqual(self.w(4, "01_media/"), "01_media/")
+
+    def test_nothing_on_spaces_or_symbols(self):
+        self.assertIsNone(self.w(2, "a    b"))
+        self.assertIsNone(self.w(1, "   "))
+        self.assertIsNone(self.w(0, ""))
+        self.assertIsNone(self.w(1, "( )"))
+        self.assertIsNone(self.w(99, "abc"))
+
+
 if __name__ == "__main__":
     unittest.main()
