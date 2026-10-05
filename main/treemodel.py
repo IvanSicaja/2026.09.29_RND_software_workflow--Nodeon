@@ -531,6 +531,27 @@ def duplicate(node: Node) -> Node:
     return c
 
 
+def node_after_subtree(node: Node) -> Optional[Node]:
+    """First node below the node and all of its sub-items (None at the end)."""
+    n = node
+    while n.parent is not None:
+        p = n.parent
+        i = n.index
+        if i + 1 < len(p.children):
+            return p.children[i + 1]
+        n = p
+    return None
+
+
+def insert_spacer(doc: TreeDocument, before: Optional[Node]) -> None:
+    """Insert one empty spacer line right above `before` (at its level, the
+    vertical lines on the left are kept). None = at the end of the document."""
+    if before is None:
+        doc.trailing_blank += 1
+    else:
+        before.gap_before += 1
+
+
 def previous_in_order(doc: TreeDocument, node: Node) -> Optional[Node]:
     prev = None
     for n in doc.iter_nodes():

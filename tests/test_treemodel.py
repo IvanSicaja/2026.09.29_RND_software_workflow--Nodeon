@@ -186,5 +186,39 @@ class ExplanationColumns(unittest.TestCase):
         self.assertEqual(tm.render(self.doc)[0], self.SRC)
 
 
+
+class Spacers(unittest.TestCase):
+    SRC = "r/\n├── a/\n│   ├── a1\n│   └── a2\n├── b\n└── c"
+
+    def setUp(self):
+        self.doc, _ = tm.parse(self.SRC)
+        self.r = self.doc.root.children[0]
+        self.a, self.b, self.c = self.r.children
+
+    def text(self):
+        return tm.render(self.doc)[0]
+
+    def test_between_siblings_keeps_vertical_line(self):
+        tm.insert_spacer(self.doc, tm.node_after_subtree(self.a))      # before b
+        self.assertEqual(self.text(), "r/\n├── a/\n│   ├── a1\n│   └── a2\n│\n├── b\n└── c")
+
+    def test_inside_branch_keeps_both_lines(self):
+        tm.insert_spacer(self.doc, self.a.children[1])                  # between a1 and a2
+        self.assertEqual(self.text(), "r/\n├── a/\n│   ├── a1\n│   │\n│   └── a2\n├── b\n└── c")
+
+    def test_after_last_child_goes_to_next_branch(self):
+        self.assertIs(tm.node_after_subtree(self.a.children[1]), self.b)
+        self.assertIsNone(tm.node_after_subtree(self.c))
+        tm.insert_spacer(self.doc, None)
+        self.assertEqual(self.text(), self.SRC + "\n")
+
+    def test_spacers_round_trip(self):
+        tm.insert_spacer(self.doc, self.a.children[0])
+        tm.insert_spacer(self.doc, self.a.children[0])
+        text = self.text()
+        self.assertEqual(tm.format_text(text), text)
+        self.assertIn("├── a/\n│   │\n│   │\n│   ├── a1", text)
+
+
 if __name__ == "__main__":
     unittest.main()

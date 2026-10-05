@@ -23,7 +23,9 @@ import sys
 import traceback
 from typing import Callable, List, Optional, Set, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
 
 from PySide6.QtCore import (QByteArray, QEvent, QIODevice, QPointF, QRect, QRectF,
                             QSaveFile, QSettings, QSize, Qt, QTimer, Signal)
@@ -39,7 +41,83 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBo
                                QSpinBox, QTextEdit, QToolBar, QToolButton,
                                QVBoxLayout, QWidget)
 
-import treemodel as tm
+# --------------------------------------------------------------------------- #
+# Load treemodel.py - always the one next to this file
+# --------------------------------------------------------------------------- #
+REQUIRED_MODEL_NAMES = ("FormatOptions", "Node", "TreeDocument", "TreeError", "parse",
+                        "render", "format_text", "shift_comments", "insert_spacer",
+                        "node_after_subtree")
+
+
+class ModelLoadError(Exception):
+    """treemodel.py is missing, empty, outdated or not Nodeon's file."""
+
+
+def load_treemodel(directory: str = APP_DIR):
+    """Import treemodel.py from `directory` (the folder of main.py).
+
+    Loading by path guarantees we never pick up another "treemodel" (a
+    folder or package with the same name elsewhere on the computer). The
+    file is checked, so a wrong file gives a clear message instead of a
+    crash deep inside the program."""
+    import importlib.util
+
+    if getattr(sys, "frozen", False):                 # packaged .exe (PyInstaller)
+        import treemodel as module
+        return module
+    path = os.path.join(directory, "treemodel.py")
+    if not os.path.isfile(path):
+        raise ModelLoadError(
+            f"The file treemodel.py was not found.\n\nExpected here:\n{path}\n\n"
+            "treemodel.py must be in the same folder as main.py.")
+    if os.path.getsize(path) == 0:
+        raise ModelLoadError(f"treemodel.py is empty (0 bytes):\n{path}\n\n"
+                             "Replace it with Nodeon's treemodel.py.")
+    if getattr(sys, "_nodeon_loading_model", False):
+        # treemodel.py itself started loading treemodel.py: it is a copy of main.py.
+        raise ModelLoadError(f"treemodel.py contains the code of main.py:\n{path}\n\n"
+                             "Replace it with Nodeon's treemodel.py.")
+    spec = importlib.util.spec_from_file_location("treemodel", path)
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get("treemodel")
+    sys.modules["treemodel"] = module
+    sys._nodeon_loading_model = True
+    try:
+        spec.loader.exec_module(module)
+    except ModelLoadError:
+        if previous is not None:
+            sys.modules["treemodel"] = previous
+        else:
+            sys.modules.pop("treemodel", None)
+        raise
+    except Exception as ex:
+        if previous is not None:
+            sys.modules["treemodel"] = previous
+        else:
+            sys.modules.pop("treemodel", None)
+        raise ModelLoadError(f"treemodel.py could not be loaded:\n{path}\n\n"
+                             f"{type(ex).__name__}: {ex}") from ex
+    finally:
+        sys._nodeon_loading_model = False
+    missing = [n for n in REQUIRED_MODEL_NAMES if not hasattr(module, n)]
+    if missing:
+        if previous is not None:
+            sys.modules["treemodel"] = previous
+        else:
+            sys.modules.pop("treemodel", None)
+        raise ModelLoadError(
+            f"This treemodel.py is not Nodeon's file, or it is outdated:\n{path}\n\n"
+            f"Missing: {', '.join(missing)}\n\n"
+            "Replace it with the treemodel.py that belongs to this version of main.py.")
+    return module
+
+
+try:
+    tm = load_treemodel()
+    MODEL_ERROR: Optional[str] = None
+except ModelLoadError as _ex:
+    tm = None  # type: ignore[assignment]
+    MODEL_ERROR = str(_ex)
 
 APP_NAME = "Nodeon"
 APP_VERSION = "1.0.0"
@@ -571,6 +649,43 @@ class TreeEditor(QPlainTextEdit):
         self._model.root.append_child(n)
         return n, "start"
 
+    def insert_spacer(self) -> None:
+        """Alt+Enter: insert an empty line below the current line. The vertical
+        branch lines on the left are kept; everything else stays the same."""
+        self.ensure_parsed()
+        line = self.textCursor().blockNumber()
+        if self._model.is_empty() or not (0 <= line < len(self._map)):
+            self.statusMessage.emit("Put the cursor on a branch line first")
+            return
+        kind = self._map.kinds[line]
+        node = self._map.nodes[line]
+        if kind == tm.KIND_GAP:
+            target = node                     # another empty line at the same place
+        elif kind in (tm.KIND_NODE, tm.KIND_COMMENT) and node is not None:
+            header = self._map.line_of(node)
+            if node.children and header not in self.collapsed_headers():
+                target = node.children[0]     # between the branch and its first sub-item
+            else:
+                target = tm.node_after_subtree(node)
+        else:
+            self.statusMessage.emit("Put the cursor on a branch line first")
+            return
+
+        def op(_n):
+            tm.insert_spacer(self._model, target)
+            return None, "keep"
+
+        if not self.run_op(op, require_node=False):
+            return
+        doc = self.document()
+        new_line = (self._map.line_of(target) - 1) if target is not None else doc.blockCount() - 1
+        block = doc.findBlockByNumber(max(0, new_line))
+        cur = QTextCursor(block)
+        cur.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+        self.statusMessage.emit("Empty line inserted - Ctrl+Z to undo")
+
     def delete_branch(self) -> None:
         def op(node):
             parent = node.parent
@@ -1019,6 +1134,13 @@ def _draw_icon(p: QPainter, kind: str) -> None:
         p.drawEllipse(QPointF(6, 5), 2.2, 2.2)          # parent item
         line((6, 7.5), (6, 15), (11, 15))               # branch into it
         plus(17, 15, 3.5)
+    elif kind == "spacer":                              # space between two rows
+        line((5, 3), (5, 21))
+        line((5, 5), (11, 5))
+        line((5, 19), (11, 19))
+        line((16, 8), (16, 16))
+        line((13.5, 10.5), (16, 8), (18.5, 10.5))
+        line((13.5, 13.5), (16, 16), (18.5, 13.5))
     elif kind == "edit":
         line((15, 4), (20, 9), (9, 20), (4, 20), (4, 15), (15, 4))
         line((12.5, 6.5), (17.5, 11.5))
@@ -1473,6 +1595,8 @@ class MainWindow(QMainWindow):
 
         self.a_add_sibling = A("Add item below", e.add_sibling,
                                ["Ctrl+Return", "Ctrl+Enter"], "New item on the same level")
+        self.a_spacer = A("Insert empty line", e.insert_spacer, ["Alt+Return", "Alt+Enter"],
+                          "Insert an empty line below (vertical branch lines are kept)")
         self.a_add_child = A("Add sub-item", e.add_child,
                              ["Ctrl+Shift+Return", "Ctrl+Shift+Enter"], "New item inside this one")
         self.a_edit = A("Edit name && explanation…", lambda: e.edit_current(), EDIT_SHORTCUT,
@@ -1507,7 +1631,7 @@ class MainWindow(QMainWindow):
 
         e.reserve_shortcuts(self.actions())
         e.context_actions = [self.a_edit, self.a_explain, None, self.a_add_sibling,
-                             self.a_add_child, self.a_duplicate, self.a_delete, None,
+                             self.a_add_child, self.a_spacer, self.a_duplicate, self.a_delete, None,
                              self.a_up, self.a_down, self.a_left, self.a_right, None,
                              self.a_toggle, self.a_collapse_branch, self.a_expand_branch]
 
@@ -1528,7 +1652,7 @@ class MainWindow(QMainWindow):
         m.addActions([self.a_find, self.a_find_next, self.a_find_prev])
 
         m = mb.addMenu("&Tree")
-        m.addActions([self.a_add_sibling, self.a_add_child, self.a_edit, self.a_explain,
+        m.addActions([self.a_add_sibling, self.a_add_child, self.a_spacer, self.a_edit, self.a_explain,
                       self.a_duplicate, self.a_delete])
         m.addSeparator()
         m.addActions([self.a_up, self.a_down, self.a_left, self.a_right])
@@ -1580,6 +1704,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb2)
         self._add_tool_buttons(tb2, [
             (self.a_add_sibling, "Add item"), (self.a_add_child, "Add sub-item"),
+            (self.a_spacer, "Empty line"),
             (self.a_edit, "Explanation"), None,
             (self.a_up, "Move up"), (self.a_down, "Move down"),
             (self.a_left, "Move left"), (self.a_right, "Move right"), None,
@@ -1602,6 +1727,7 @@ class MainWindow(QMainWindow):
                 (self.a_collapse_all, "collapse_all"), (self.a_collapse_level, "collapse_level"),
                 (self.a_expand_level, "expand_level"), (self.a_expand_all, "expand_all"),
                 (self.a_add_sibling, "add_item"), (self.a_add_child, "add_child"),
+                (self.a_spacer, "spacer"),
                 (self.a_edit, "edit"), (self.a_delete, "delete"),
                 (self.a_up, "up"), (self.a_down, "down"), (self.a_left, "left"),
                 (self.a_right, "right"), (self.a_format, "format"),
@@ -1809,6 +1935,7 @@ class MainWindow(QMainWindow):
             ("Editing", ""),
             ("New item (same level)", "Enter at end of name  or  Ctrl+Enter"),
             ("New sub-item", "Ctrl+Shift+Enter"),
+            ("Insert empty line (vertical lines kept)", "Alt+Enter"),
             ("Move right / left one level", "Tab / Shift+Tab  (or Alt+Shift+→ / ←)"),
             ("Move up / down", "Alt+Shift+↑ / ↓"),
             ("Edit name & explanation", f"{EDIT_SHORTCUT}  (explanation only: Ctrl+E)"),
@@ -1865,6 +1992,10 @@ def _install_excepthook() -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    if MODEL_ERROR is not None:
+        sys.stderr.write(MODEL_ERROR + "\n")
+        QMessageBox.critical(None, f"{APP_NAME} - cannot start", MODEL_ERROR)
+        return 1
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("Nodeon")
     ui_font = app.font()

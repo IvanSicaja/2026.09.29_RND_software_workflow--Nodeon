@@ -206,6 +206,63 @@ class GuiTests(unittest.TestCase):
         self.key(K.Key_Right, M.AltModifier)
         self.assertEqual(self.ed.toPlainText(), before)
 
+    # empty spacer lines (Alt+Enter) -----------------------------------------
+    SPACER_SRC = "r/\n├── a/\n│   ├── a1      # one\n│   └── a2\n├── b\n└── c"
+
+    def _spacer_doc(self):
+        self.ed.set_document_text(self.SPACER_SRC)
+
+    def test_alt_enter_between_siblings(self):
+        self._spacer_doc()
+        self.goto(2)                                     # a1
+        self.key(K.Key_Return, M.AltModifier)
+        self.assertEqual(self.lines()[:5], ["r/", "├── a/", "│   ├── a1      # one", "│   │", "│   └── a2"])
+        self.assertEqual(self.ed.textCursor().blockNumber(), 3)   # cursor on the new line
+        self.key(K.Key_Return, M.AltModifier)            # again: one more empty line
+        self.assertEqual(self.lines()[3:6], ["│   │", "│   │", "│   └── a2"])
+
+    def test_alt_enter_on_open_branch_and_last_child(self):
+        self._spacer_doc()
+        self.goto(1)                                     # a/ (open) -> before a1
+        self.key(K.Key_Return, M.AltModifier)
+        self.assertEqual(self.lines()[1:4], ["├── a/", "│   │", "│   ├── a1      # one"])
+        self.assertEqual(self.lines()[4], "│   └── a2")
+        self.goto(4)                                     # a2 (last child) -> before b
+        self.key(K.Key_Return, M.AltModifier)
+        self.assertEqual(self.lines()[4:7], ["│   └── a2", "│", "├── b"])
+
+    def test_alt_enter_on_collapsed_branch_goes_below_it(self):
+        self._spacer_doc()
+        self.ed.toggle_fold(1)                           # fold a/
+        self.goto(1)
+        self.key(K.Key_Return, M.AltModifier)
+        self.assertEqual(self.lines()[4:6], ["│", "├── b"])
+        self.assertIn(1, self.ed.collapsed_headers())    # fold kept
+
+    def test_alt_enter_last_line_undo_and_keys_kept(self):
+        self._spacer_doc()
+        self.goto(5)                                     # c, last line
+        self.key(K.Key_Return, M.AltModifier)
+        self.assertEqual(self.lines()[-1], "")
+        self.key(K.Key_Z, M.ControlModifier)
+        self.assertEqual(self.ed.toPlainText(), self.SPACER_SRC)
+        # plain Enter still creates the next item, Shift+Enter a raw newline
+        self.goto(4)
+        self.ed.moveCursor(QTextCursor.MoveOperation.EndOfBlock)
+        self.key(K.Key_Return)
+        self.assertEqual(self.lines()[5], "├── ")
+        self.assertIn("Empty line", [b._label for b in self.win.findChildren(app_module.ActionButton)])
+
+    def test_alt_enter_save_round_trip(self):
+        self._spacer_doc()
+        self.goto(2)
+        self.key(K.Key_Return, M.AltModifier)
+        expected = self.ed.toPlainText()
+        self.win.path = self.path
+        self.assertTrue(self.win.save())
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), expected + "\n")
+
     # existing behaviour still works ------------------------------------
     def test_folding_levels(self):
         self.ed.collapse_all()
@@ -223,6 +280,61 @@ class GuiTests(unittest.TestCase):
         QTest.keyClicks(self.ed, "main.py")
         self.key(K.Key_Tab)
         self.assertEqual(self.ed.toPlainText(), "root/\n│\n└── src/\n    └── main.py")
+
+
+@unittest.skipIf(QApplication is None, "PySide6 is not installed")
+class StartupTests(unittest.TestCase):
+    """main.py must always load the treemodel.py next to it, and explain
+    clearly (instead of crashing) when that file is missing or wrong."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="nodeon-start-")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _write(self, name, text):
+        with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def assertLoadError(self, fragment):
+        before = sys.modules.get("treemodel")
+        with self.assertRaises(app_module.ModelLoadError) as ctx:
+            app_module.load_treemodel(self.dir)
+        self.assertIn(fragment, str(ctx.exception))
+        self.assertIs(sys.modules.get("treemodel"), before)   # nothing left broken
+
+    def test_correct_file_loads(self):
+        src = os.path.join(PROJECT_ROOT, "main", "treemodel.py")
+        shutil.copy(src, self.dir)
+        before = sys.modules.get("treemodel")
+        try:
+            mod = app_module.load_treemodel(self.dir)
+            self.assertTrue(hasattr(mod, "FormatOptions"))
+            self.assertEqual(os.path.dirname(mod.__file__), self.dir)
+        finally:
+            sys.modules["treemodel"] = before
+
+    def test_missing_file(self):
+        os.mkdir(os.path.join(self.dir, "treemodel"))      # a folder with the same name
+        self.assertLoadError("was not found")
+
+    def test_empty_file(self):
+        self._write("treemodel.py", "")
+        self.assertLoadError("empty")
+
+    def test_wrong_file(self):
+        self._write("treemodel.py", "x = 1\n")
+        self.assertLoadError("Missing: FormatOptions")
+
+    def test_broken_file(self):
+        self._write("treemodel.py", "def broken(:\n")
+        self.assertLoadError("could not be loaded")
+
+    def test_app_uses_file_next_to_main(self):
+        self.assertIsNone(app_module.MODEL_ERROR)
+        self.assertEqual(os.path.normcase(os.path.dirname(app_module.tm.__file__)),
+                         os.path.normcase(os.path.join(PROJECT_ROOT, "main")))
 
 
 if __name__ == "__main__":
