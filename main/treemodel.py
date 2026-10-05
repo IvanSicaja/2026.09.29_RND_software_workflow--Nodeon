@@ -552,6 +552,26 @@ def insert_spacer(doc: TreeDocument, before: Optional[Node]) -> None:
         before.gap_before += 1
 
 
+NodeKey = Tuple[Tuple[str, int], ...]
+
+
+def node_keys(doc: TreeDocument) -> Dict[int, NodeKey]:
+    """id(node) -> stable key: the names from the top down, each with its
+    occurrence number among same-named siblings (so duplicates stay distinct)."""
+    keys: Dict[int, NodeKey] = {}
+    stack: List[Tuple[Node, NodeKey]] = [(doc.root, ())]
+    while stack:
+        parent, pkey = stack.pop()
+        seen: Dict[str, int] = {}
+        for c in parent.children:
+            nth = seen.get(c.name, 0)
+            seen[c.name] = nth + 1
+            key = pkey + ((c.name, nth),)
+            keys[id(c)] = key
+            stack.append((c, key))
+    return keys
+
+
 def previous_in_order(doc: TreeDocument, node: Node) -> Optional[Node]:
     prev = None
     for n in doc.iter_nodes():

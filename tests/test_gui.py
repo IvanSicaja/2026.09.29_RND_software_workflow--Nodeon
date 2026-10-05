@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "main"))
 
 try:
     from PySide6.QtCore import QSettings, Qt
-    from PySide6.QtGui import QTextCursor
+    from PySide6.QtGui import QColor, QTextCursor
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog
 except ImportError:                                     # pragma: no cover
@@ -62,6 +62,9 @@ class GuiTests(unittest.TestCase):
 
     def setUp(self):
         self.path = os.path.join(self.tmp, "tree.txt")
+        marks = self.path + ".marks.json"
+        if os.path.exists(marks):
+            os.remove(marks)
         with open(self.path, "w", encoding="utf-8") as f:
             f.write(SAMPLE + "\n")
         self.win = app_module.MainWindow(self.path)
@@ -262,6 +265,129 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(self.win.save())
         with open(self.path, encoding="utf-8") as f:
             self.assertEqual(f.read(), expected + "\n")
+
+    # colour marks ------------------------------------------------------------
+    def color_at(self, line, text):
+        """Foreground colour (hex) of `text` in `line` as drawn on screen."""
+        block = self.ed.document().findBlockByNumber(line)
+        pos = block.text().index(text)
+        for r in block.layout().formats():
+            if r.start <= pos < r.start + r.length:
+                return r.format.foreground().color().name()
+        return None
+
+    def mark(self, line, key):
+        self.goto(line)
+        self.key(key, M.AltModifier)
+
+    def test_mark_colours_only_the_name(self):
+        theme = self.ed.theme
+        text_before = self.ed.toPlainText()
+        self.mark(2, K.Key_G)                       # src/
+        self.assertEqual(self.color_at(2, "src/"), QColor(theme.mark_checked).name())
+        self.assertEqual(self.color_at(2, "# Source"), QColor(theme.comment).name())
+        self.assertEqual(self.color_at(2, "├──"), QColor(theme.guide).name())
+        self.assertEqual(self.ed.toPlainText(), text_before)       # text unchanged
+        self.assertFalse(self.ed.document().isModified())
+        self.mark(3, K.Key_O)
+        self.assertEqual(self.color_at(3, "main.py"), QColor(theme.mark_explore).name())
+        self.mark(7, K.Key_R)
+        self.assertEqual(self.color_at(7, "README.md"), QColor(theme.mark_problem).name())
+
+    def test_comment_colour_is_not_text_or_mark_colour(self):
+        t = self.ed.theme
+        self.assertEqual(self.color_at(2, "# Source"), QColor(t.comment).name())
+        others = {QColor(c).name() for c in (t.fg, t.file, t.mark_checked,
+                                                t.mark_explore, t.mark_problem)}
+        self.assertNotIn(QColor(t.comment).name(), others)
+
+    def test_same_key_again_and_alt_c_remove(self):
+        self.mark(2, K.Key_G)
+        self.mark(2, K.Key_G)
+        self.assertEqual(self.color_at(2, "src/"), QColor(self.ed.theme.folder).name())
+        self.mark(2, K.Key_R)
+        self.mark(2, K.Key_C)
+        self.assertEqual(self.color_at(2, "src/"), QColor(self.ed.theme.folder).name())
+        self.assertEqual(self.ed.export_marks(), [])
+
+    def test_mark_selection(self):
+        cur = QTextCursor(self.ed.document().findBlockByNumber(2))
+        cur.setPosition(self.ed.document().findBlockByNumber(4).position() + 3,
+                        QTextCursor.MoveMode.KeepAnchor)
+        self.ed.setTextCursor(cur)
+        self.key(K.Key_O, M.AltModifier)
+        self.assertEqual(len(self.ed.export_marks()), 3)
+        self.assertTrue(self.ed.textCursor().hasSelection())
+
+    def test_marks_follow_branches_and_undo(self):
+        self.mark(7, K.Key_R)                       # README.md
+        self.mark(5, K.Key_G)                       # docs/
+        self.goto(7)
+        self.key(K.Key_Up, M.AltModifier | M.ShiftModifier)   # README above docs
+        readme = [i for i, l in enumerate(self.lines()) if "README" in l][0]
+        docs = [i for i, l in enumerate(self.lines()) if "docs/" in l][0]
+        self.assertEqual(self.color_at(readme, "README.md"), QColor(self.ed.theme.mark_problem).name())
+        self.assertEqual(self.color_at(docs, "docs/"), QColor(self.ed.theme.mark_checked).name())
+        self.key(K.Key_Z, M.ControlModifier)
+        QTest.qWait(300)                            # let the editor re-read the text
+        self.assertEqual(self.color_at(7, "README.md"), QColor(self.ed.theme.mark_problem).name())
+        self.assertEqual(self.color_at(5, "docs/"), QColor(self.ed.theme.mark_checked).name())
+
+    def test_mark_survives_typing_and_folding(self):
+        self.mark(2, K.Key_G)
+        self.ed.toggle_fold(2)
+        self.assertIn(2, self.ed.collapsed_headers())
+        self.assertEqual(self.color_at(2, "src/"), QColor(self.ed.theme.mark_checked).name())
+        self.ed.toggle_fold(2)
+        self.goto(2)
+        self.ed.moveCursor(QTextCursor.MoveOperation.EndOfBlock)
+        QTest.keyClicks(self.ed, " more")
+        QTest.qWait(300)
+        self.assertEqual(self.color_at(2, "src/"), QColor(self.ed.theme.mark_checked).name())
+        self.assertNotIn(2, self.ed.collapsed_headers())
+
+    def test_marks_saved_next_to_file_and_reloaded(self):
+        self.mark(2, K.Key_G)
+        self.mark(7, K.Key_O)
+        marks_file = self.path + ".marks.json"
+        self.assertTrue(os.path.isfile(marks_file))           # stored right away
+        with open(self.path, encoding="utf-8") as f:
+            self.assertNotIn("checked", f.read())              # .txt stays pure text
+        self.win.close()
+        win2 = app_module.MainWindow(self.path)
+        try:
+            marks = dict(win2.editor.export_marks())
+            self.assertEqual(sorted(marks.values()), [app_module.MARK_CHECKED,
+                                                      app_module.MARK_EXPLORE])
+            # removing the last marks deletes the marks file
+            for line in (2, 7):
+                c = QTextCursor(win2.editor.document().findBlockByNumber(line))
+                win2.editor.setTextCursor(c)
+                win2.editor.mark_selection(app_module.MARK_NONE)
+            self.assertFalse(os.path.exists(marks_file))
+        finally:
+            win2.editor.document().setModified(False)
+            win2.close()
+
+    def test_broken_marks_file_is_ignored(self):
+        self.win.close()
+        with open(self.path + ".marks.json", "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        win2 = app_module.MainWindow(self.path)
+        try:
+            self.assertEqual(win2.editor.export_marks(), [])
+            self.assertIn("could not be read", win2.statusBar().currentMessage())
+        finally:
+            win2.editor.document().setModified(False)
+            win2.close()
+
+    def test_mark_toolbar_and_shortcut_texts(self):
+        labels = {b._label: b for b in self.win.findChildren(app_module.ActionButton)}
+        self.assertIn("Mark", labels)
+        self.assertEqual(labels["Mark"]._keys(), "Alt+G / O / R")
+        self.assertEqual(len(labels["Mark"].menu().actions()), 4)
+        self.assertEqual([app_module.shortcut_text(a) for a in self.win.mark_actions],
+                         ["Alt+G", "Alt+O", "Alt+R", "Alt+C"])
 
     # existing behaviour still works ------------------------------------
     def test_folding_levels(self):

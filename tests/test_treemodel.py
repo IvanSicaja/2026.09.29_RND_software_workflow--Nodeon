@@ -220,5 +220,24 @@ class Spacers(unittest.TestCase):
         self.assertIn("├── a/\n│   │\n│   │\n│   ├── a1", text)
 
 
+
+class NodeKeys(unittest.TestCase):
+    def test_keys_are_paths_with_duplicate_numbers(self):
+        doc, _ = tm.parse("r/\n├── a/\n│   └── x\n├── a/\n│   └── x\n└── b")
+        keys = tm.node_keys(doc)
+        nodes = list(doc.iter_nodes())
+        self.assertEqual(keys[id(nodes[1])], (("r/", 0), ("a/", 0)))
+        self.assertEqual(keys[id(nodes[3])], (("r/", 0), ("a/", 1)))
+        self.assertEqual(keys[id(nodes[4])], (("r/", 0), ("a/", 1), ("x", 0)))
+        self.assertEqual(len(set(keys.values())), len(nodes))
+
+    def test_keys_stable_after_moving_siblings(self):
+        doc, _ = tm.parse("r/\n├── a\n└── b")
+        a = doc.root.children[0].children[0]
+        before = tm.node_keys(doc)[id(a)]
+        tm.move_down(a)
+        self.assertEqual(tm.node_keys(doc)[id(a)], before)
+
+
 if __name__ == "__main__":
     unittest.main()

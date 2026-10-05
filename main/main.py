@@ -17,11 +17,12 @@ The file on disk is always pure UTF-8 text in this format:
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 import traceback
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
@@ -35,7 +36,7 @@ from PySide6.QtGui import (QAction, QColor, QFont, QFontDatabase, QFontMetrics, 
                            QSyntaxHighlighter, QTextCharFormat, QTextCursor,
                            QTextFormat)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
-                               QStyle, QStyleOptionToolButton, QStylePainter,
+                               QMenu, QStyle, QStyleOptionToolButton, QStylePainter,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
                                QSpinBox, QTextEdit, QToolBar, QToolButton,
@@ -46,7 +47,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBo
 # --------------------------------------------------------------------------- #
 REQUIRED_MODEL_NAMES = ("FormatOptions", "Node", "TreeDocument", "TreeError", "parse",
                         "render", "format_text", "shift_comments", "insert_spacer",
-                        "node_after_subtree")
+                        "node_after_subtree", "node_keys")
 
 
 class ModelLoadError(Exception):
@@ -121,7 +122,42 @@ except ModelLoadError as _ex:
 
 APP_NAME = "Nodeon"
 APP_VERSION = "1.0.0"
-COLLAPSED = 1                      # QTextBlock.userState() flag of a folded branch
+COLLAPSED = 1                      # QTextBlock.userState() bit of a folded branch
+
+# Status marks for branch names (bits 1-2 of QTextBlock.userState()).
+MARK_NONE, MARK_CHECKED, MARK_EXPLORE, MARK_PROBLEM = 0, 1, 2, 3
+MARK_NAMES = {MARK_CHECKED: "checked", MARK_EXPLORE: "explore", MARK_PROBLEM: "problem"}
+MARK_LABELS = {MARK_CHECKED: "Checked", MARK_EXPLORE: "To explore", MARK_PROBLEM: "Problem"}
+_MARK_BITS = 0b110
+
+
+def _state(block) -> int:
+    s = block.userState()
+    return 0 if s < 0 else s
+
+
+def is_collapsed(block) -> bool:
+    return bool(_state(block) & COLLAPSED)
+
+
+def set_collapsed(block, on: bool) -> None:
+    s = _state(block)
+    new = (s | COLLAPSED) if on else (s & ~COLLAPSED)
+    if new != s:
+        block.setUserState(new if new else -1)
+
+
+def mark_of(block) -> int:
+    return (_state(block) & _MARK_BITS) >> 1
+
+
+def set_mark_bits(block, mark: int) -> bool:
+    s = _state(block)
+    new = (s & ~_MARK_BITS) | ((mark & 3) << 1)
+    if new != s:
+        block.setUserState(new if new else -1)
+        return True
+    return False
 NEW_DOCUMENT = "new-project/\n│\n└── "
 # Shortcut for "Edit name & explanation". Change it here if you prefer another one.
 EDIT_SHORTCUT = "Ctrl+Shift+E"
@@ -162,7 +198,9 @@ class Theme:
         if dark:
             self.bg, self.fg = "#1e1f22", "#c9ccd3"
             self.gutter_bg, self.gutter_fg, self.gutter_cur = "#1e1f22", "#4e525a", "#a9acb4"
-            self.guide, self.comment = "#5a5e66", "#7fa864"
+            self.guide, self.comment = "#5a5e66", "#a78bfa"      # violet-400
+            # Status marks (Tailwind 400): checked / to explore / problem
+            self.mark_checked, self.mark_explore, self.mark_problem = "#34d399", "#fb923c", "#f87171"
             self.folder, self.file = "#6aaef0", "#c9ccd3"
             self.current_line, self.fold = "#26282e", "#9da0a8"
             self.badge_bg, self.badge_fg = "#3a3d44", "#c9ccd3"
@@ -170,7 +208,9 @@ class Theme:
         else:
             self.bg, self.fg = "#ffffff", "#1f2328"
             self.gutter_bg, self.gutter_fg, self.gutter_cur = "#f6f7f9", "#a4a9b1", "#3b4048"
-            self.guide, self.comment = "#9ca2ab", "#3f7f45"
+            self.guide, self.comment = "#9ca2ab", "#7c3aed"      # violet-600
+            # Status marks (Tailwind 500): checked / to explore / problem
+            self.mark_checked, self.mark_explore, self.mark_problem = "#10b981", "#f97316", "#ef4444"
             self.folder, self.file = "#1d5fbf", "#1f2328"
             self.current_line, self.fold = "#f3f6fb", "#6c717a"
             self.badge_bg, self.badge_fg = "#e5e9f0", "#3b4048"
@@ -223,6 +263,10 @@ class TreeHighlighter(QSyntaxHighlighter):
         self.f_comment = fmt(theme.comment)
         self.f_folder = fmt(theme.folder, bold=True)
         self.f_file = fmt(theme.file)
+        self.mark_colors = {MARK_CHECKED: theme.mark_checked, MARK_EXPLORE: theme.mark_explore,
+                            MARK_PROBLEM: theme.mark_problem}
+        self.f_marks = {(m, bold): fmt(c, bold=bold)
+                        for m, c in self.mark_colors.items() for bold in (False, True)}
         if rehighlight:
             self.rehighlight()
 
@@ -248,8 +292,13 @@ class TreeHighlighter(QSyntaxHighlighter):
         name = text[i:c].strip()
         if name:
             start = text.index(name, i)
-            self.setFormat(start, len(name),
-                           self.f_folder if name.endswith(("/", "\\")) else self.f_file)
+            folder = name.endswith(("/", "\\"))
+            mark = mark_of(self.currentBlock())
+            if mark:
+                fmt = self.f_marks[(mark, folder)]
+            else:
+                fmt = self.f_folder if folder else self.f_file
+            self.setFormat(start, len(name), fmt)
         if hm:
             self.setFormat(c, n - c, self.f_comment)
 
@@ -276,6 +325,7 @@ class FoldGutter(QWidget):
 class TreeEditor(QPlainTextEdit):
     statusMessage = Signal(str)
     foldsChanged = Signal()
+    marksChanged = Signal()
     openFileRequested = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -287,6 +337,9 @@ class TreeEditor(QPlainTextEdit):
         self._parsed_rev = -1
         self._last_block = 0
         self._reserved_keys: Set[int] = set()
+        # Status marks by node key; the line states are the live copy, this
+        # registry restores marks after Undo and is what gets saved.
+        self.marks: Dict[tm.NodeKey, int] = {}
         self.context_actions: List[Optional[QAction]] = []
 
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
@@ -342,6 +395,7 @@ class TreeEditor(QPlainTextEdit):
 
     # ---- document ----------------------------------------------------------
     def set_document_text(self, text: str) -> None:
+        self.marks = {}
         self.setPlainText(text)
         self.document().clearUndoRedoStacks()
         self.refresh(force=True)
@@ -371,6 +425,9 @@ class TreeEditor(QPlainTextEdit):
             self._model, self._map = tm.parse(self.toPlainText())
             self._ranges = self._map.fold_ranges()
             self._parsed_rev = self.document().revision()
+            self._apply_folds()
+            self._sync_marks()
+            return
         self._apply_folds()
 
     def ensure_parsed(self) -> None:
@@ -382,7 +439,7 @@ class TreeEditor(QPlainTextEdit):
         return self.document().findBlockByNumber(line)
 
     def collapsed_headers(self) -> Set[int]:
-        return {h for h in self._ranges if self._block(h).userState() == COLLAPSED}
+        return {h for h in self._ranges if is_collapsed(self._block(h))}
 
     def _apply_folds(self, collapsed: Optional[Set[int]] = None) -> None:
         doc = self.document()
@@ -399,11 +456,7 @@ class TreeEditor(QPlainTextEdit):
         dirty_from, dirty_to = -1, -1
         block, i = doc.begin(), 0
         while block.isValid():
-            if i in collapsed:
-                if block.userState() != COLLAPSED:
-                    block.setUserState(COLLAPSED)
-            elif block.userState() == COLLAPSED:
-                block.setUserState(-1)
+            set_collapsed(block, i in collapsed)
             visible = not hidden[i]
             if block.isVisible() != visible:
                 block.setVisible(visible)
@@ -578,6 +631,7 @@ class TreeEditor(QPlainTextEdit):
             self.statusMessage.emit("Put the cursor on a branch line first")
             return False
         collapsed_nodes = [self._map.nodes[h] for h in self.collapsed_headers()]
+        marked_nodes = self._marked_nodes()
         vscroll = self.verticalScrollBar().value()
         try:
             focus, mode = op(node)
@@ -600,6 +654,8 @@ class TreeEditor(QPlainTextEdit):
                 collapsed.discard(lm.line_of(a))
                 a = a.parent
         self._apply_folds(collapsed)
+        self._sync_marks({lm.line_of(n): m for n, m in marked_nodes
+                          if lm.line_of(n) is not None})
         self.verticalScrollBar().setValue(vscroll)
         if focus is not None and lm.line_of(focus) is not None:
             self._place_cursor(focus, mode, offset)
@@ -648,6 +704,102 @@ class TreeEditor(QPlainTextEdit):
         n = tm.Node("")
         self._model.root.append_child(n)
         return n, "start"
+
+    # ---- status marks (coloured branch names) ---------------------------
+    def _marked_nodes(self) -> List[Tuple[tm.Node, int]]:
+        out = []
+        for node in self._model.iter_nodes():
+            h = self._map.line_of(node)
+            if h is not None:
+                m = mark_of(self._block(h))
+                if m:
+                    out.append((node, m))
+        return out
+
+    def _sync_marks(self, desired: Optional[Dict[int, int]] = None) -> None:
+        """Bring line states and the mark registry in line.
+
+        desired (line -> mark) is given after a re-render: every line gets
+        exactly that mark. Afterwards, branch lines without a mark take it
+        from the registry (e.g. after Undo) and marked lines update it."""
+        doc = self.document()
+        changed = []
+        if desired is not None:
+            block, i = doc.begin(), 0
+            while block.isValid():
+                if set_mark_bits(block, desired.get(i, MARK_NONE)):
+                    changed.append(block)
+                block = block.next()
+                i += 1
+        keys = tm.node_keys(self._model)
+        for node in self._model.iter_nodes():
+            h = self._map.line_of(node)
+            if h is None or h >= doc.blockCount():
+                continue
+            block = self._block(h)
+            key = keys[id(node)]
+            m = mark_of(block)
+            if m:
+                self.marks[key] = m
+            elif key in self.marks and set_mark_bits(block, self.marks[key]):
+                changed.append(block)
+        for block in changed:
+            self.highlighter.rehighlightBlock(block)
+
+    def _selected_lines(self) -> Tuple[int, int, bool]:
+        """(first line, last line, has_selection)"""
+        doc = self.document()
+        cur = self.textCursor()
+        if not cur.hasSelection():
+            n = cur.blockNumber()
+            return n, n, False
+        a, p = cur.anchor(), cur.position()
+        first_b, last_b = doc.findBlock(min(a, p)), doc.findBlock(max(a, p))
+        first, last = first_b.blockNumber(), last_b.blockNumber()
+        if last > first and max(a, p) == last_b.position():
+            last -= 1                    # selection ends at the start of a line
+        return first, last, True
+
+    def mark_selection(self, mark: int) -> None:
+        """Colour the names of the branch at the cursor (or of every branch in
+        the selection). Pressing the same mark again removes it."""
+        self.ensure_parsed()
+        first, last, _ = self._selected_lines()
+        nodes: List[tm.Node] = []
+        seen: Set[int] = set()
+        for line in range(first, last + 1):
+            n = self._map.node_at(line)
+            if n is not None and id(n) not in seen and self._map.line_of(n) is not None:
+                seen.add(id(n))
+                nodes.append(n)
+        if not nodes:
+            self.statusMessage.emit("Put the cursor on a branch line first")
+            return
+        blocks = [self._block(self._map.line_of(n)) for n in nodes]
+        if mark and all(mark_of(b) == mark for b in blocks):
+            mark = MARK_NONE                                  # same key again = remove
+        keys = tm.node_keys(self._model)
+        for node, block in zip(nodes, blocks):
+            key = keys[id(node)]
+            if mark:
+                self.marks[key] = mark
+            else:
+                self.marks.pop(key, None)
+            if set_mark_bits(block, mark):
+                self.highlighter.rehighlightBlock(block)
+        what = f"{len(nodes)} branches" if len(nodes) > 1 else f"“{nodes[0].name or '(empty)'}”"
+        self.statusMessage.emit(f"{what}: {MARK_LABELS[mark]}" if mark else f"{what}: mark removed")
+        self.marksChanged.emit()
+
+    def export_marks(self) -> List[Tuple[tm.NodeKey, int]]:
+        self.ensure_parsed()
+        keys = tm.node_keys(self._model)
+        return [(keys[id(n)], m) for n, m in self._marked_nodes()]
+
+    def load_marks(self, entries: List[Tuple[tm.NodeKey, int]]) -> None:
+        self.ensure_parsed()
+        self.marks = {key: m for key, m in entries if m in MARK_NAMES}
+        self._sync_marks()
 
     def insert_spacer(self) -> None:
         """Alt+Enter: insert an empty line below the current line. The vertical
@@ -946,7 +1098,7 @@ class TreeEditor(QPlainTextEdit):
                 if geo.bottom() >= top:
                     yield block, geo
                 n = block.blockNumber()
-                if can_skip and n in self._ranges and block.userState() == COLLAPSED:
+                if can_skip and n in self._ranges and is_collapsed(block):
                     block = self._block(self._ranges[n][1] + 1)
                     continue
             block = block.next()
@@ -969,7 +1121,7 @@ class TreeEditor(QPlainTextEdit):
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, str(n + 1))
             if n in ranges:
                 self._draw_arrow(p, QRectF(w - fw - 2, top, fw, line_h),
-                                 block.userState() == COLLAPSED)
+                                 is_collapsed(block))
         p.end()
 
     def _draw_arrow(self, p: QPainter, r: QRectF, collapsed: bool) -> None:
@@ -993,7 +1145,7 @@ class TreeEditor(QPlainTextEdit):
                 n = block.blockNumber()
                 if n in self._ranges:
                     if e.modifiers() & Qt.KeyboardModifier.AltModifier:
-                        self.set_branch_recursive(n, block.userState() != COLLAPSED)
+                        self.set_branch_recursive(n, not is_collapsed(block))
                     else:
                         self.toggle_fold(n)
                 else:
@@ -1019,7 +1171,7 @@ class TreeEditor(QPlainTextEdit):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         for block, geo in self._painted_blocks(e.rect().top(), e.rect().bottom()):
             n = block.blockNumber()
-            if n in self._ranges and block.userState() == COLLAPSED:
+            if n in self._ranges and is_collapsed(block):
                 rect, label = self._badge(block, geo)
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(self.theme.badge_bg))
@@ -1033,7 +1185,7 @@ class TreeEditor(QPlainTextEdit):
             return None
         block = self.cursorForPosition(pos.toPoint()).block()
         n = block.blockNumber()
-        if n in self._ranges and block.userState() == COLLAPSED:
+        if n in self._ranges and is_collapsed(block):
             geo = self.blockBoundingGeometry(block).translated(self.contentOffset())
             if self._badge(block, geo)[0].contains(pos):
                 return n
@@ -1175,6 +1327,28 @@ def _draw_icon(p: QPainter, kind: str) -> None:
             line((15, y), (20, y))
 
 
+def make_dots_icon(colors: List[str]) -> QIcon:
+    """Filled circles (one per colour) - used for the status marks."""
+    icon = QIcon()
+    for size in (16, 20, 24, 32, 48, 64):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.scale(size / 24.0, size / 24.0)
+        p.setPen(Qt.PenStyle.NoPen)
+        if len(colors) == 1:
+            spots = [(12.0, 12.0, 6.5)]
+        else:
+            spots = [(6.0, 15.5, 3.6), (12.0, 7.5, 3.6), (18.0, 15.5, 3.6)]
+        for (x, y, r), c in zip(spots, colors):
+            p.setBrush(QColor(c))
+            p.drawEllipse(QPointF(x, y), r, r)
+        p.end()
+        icon.addPixmap(pm)
+    return icon
+
+
 def make_icon(kind: str, color: str) -> QIcon:
     icon = QIcon()
     for size in (16, 20, 24, 32, 48, 64):
@@ -1231,9 +1405,10 @@ class ActionButton(QToolButton):
     """Toolbar button: icon, name, and its keyboard shortcut underneath."""
     ICON = 24
 
-    def __init__(self, action: QAction, label: str) -> None:
+    def __init__(self, action: QAction, label: str, caption: Optional[str] = None) -> None:
         super().__init__()
         self._label = label
+        self._caption = caption
         self.setDefaultAction(action)
         self.setText(label)
         self.setAutoRaise(True)
@@ -1247,6 +1422,8 @@ class ActionButton(QToolButton):
         self.update()
 
     def _keys(self) -> str:
+        if self._caption is not None:
+            return self._caption
         return shortcut_text(self.defaultAction())
 
     def sizeHint(self) -> QSize:
@@ -1504,6 +1681,7 @@ class MainWindow(QMainWindow):
         self.editor.foldsChanged.connect(self._update_level_display)
         self.editor.cursorPositionChanged.connect(self._update_position)
         self.editor.openFileRequested.connect(self._open_dropped)
+        self.editor.marksChanged.connect(self._marks_changed)
         self.editor.document().modificationChanged.connect(self.setWindowModified)
 
         dark = self.settings.value("dark", None)
@@ -1619,6 +1797,23 @@ class MainWindow(QMainWindow):
         self.a_expl_right = A("Move explanations right", lambda: e.shift_explanations(1),
                               "Alt+Right", "Move explanations (#) right - selected lines, or the "
                               "whole document if nothing is selected")
+        self.a_mark_checked = A("Mark as checked", lambda: e.mark_selection(MARK_CHECKED),
+                                "Alt+G", "Colour the name green: checked / OK "
+                                "(press again to remove)")
+        self.a_mark_explore = A("Mark to explore", lambda: e.mark_selection(MARK_EXPLORE),
+                                "Alt+O", "Colour the name orange: still to explore "
+                                "(press again to remove)")
+        self.a_mark_problem = A("Mark as problem", lambda: e.mark_selection(MARK_PROBLEM),
+                                "Alt+R", "Colour the name red: something is not OK "
+                                "(press again to remove)")
+        self.a_mark_clear = A("Remove mark", lambda: e.mark_selection(MARK_NONE), "Alt+C",
+                              "Remove the colour mark from the name")
+        self.mark_actions = [self.a_mark_checked, self.a_mark_explore, self.a_mark_problem,
+                             self.a_mark_clear]
+        self.a_mark_menu = QAction("Mark", self)
+        self.a_mark_menu.setToolTip("Mark branch names (selected lines or the line at the "
+                                    "cursor): Checked Alt+G · To explore Alt+O · "
+                                    "Problem Alt+R · Remove Alt+C")
 
         self.a_zoom_in = A("Zoom in", lambda: self._zoom(1), ["Ctrl+=", "Ctrl++"])
         self.a_zoom_out = A("Zoom out", lambda: self._zoom(-1), "Ctrl+-")
@@ -1633,7 +1828,8 @@ class MainWindow(QMainWindow):
         e.context_actions = [self.a_edit, self.a_explain, None, self.a_add_sibling,
                              self.a_add_child, self.a_spacer, self.a_duplicate, self.a_delete, None,
                              self.a_up, self.a_down, self.a_left, self.a_right, None,
-                             self.a_toggle, self.a_collapse_branch, self.a_expand_branch]
+                             self.a_toggle, self.a_collapse_branch, self.a_expand_branch, None,
+                             *self.mark_actions]
 
     def _build_menus(self) -> None:
         mb = self.menuBar()
@@ -1658,6 +1854,8 @@ class MainWindow(QMainWindow):
         m.addActions([self.a_up, self.a_down, self.a_left, self.a_right])
         m.addSeparator()
         m.addActions([self.a_expl_left, self.a_expl_right, self.a_format])
+        m.addSeparator()
+        m.addActions(self.mark_actions)
 
         m = mb.addMenu("&View")
         m.addActions([self.a_collapse_all, self.a_collapse_level, self.a_expand_level,
@@ -1695,6 +1893,14 @@ class MainWindow(QMainWindow):
         self._add_tool_buttons(tb, [
             (self.a_expl_left, "Explanations ←"), (self.a_expl_right, "Explanations →"),
         ])
+        tb.addSeparator()
+        self.mark_menu = QMenu(self)
+        self.mark_menu.addActions(self.mark_actions)
+        mark_btn = ActionButton(self.a_mark_menu, "Mark", caption="Alt+G / O / R")
+        mark_btn.setMenu(self.mark_menu)
+        mark_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        mark_btn.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
+        tb.addWidget(mark_btn)
 
         # Row 2: editing branches
         self.addToolBarBreak()
@@ -1733,6 +1939,13 @@ class MainWindow(QMainWindow):
                 (self.a_right, "right"), (self.a_format, "format"),
                 (self.a_expl_left, "expl_left"), (self.a_expl_right, "expl_right")):
             action.setIcon(make_icon(kind, danger if kind == "delete" else color))
+        theme = self.editor.theme
+        self.a_mark_checked.setIcon(make_dots_icon([theme.mark_checked]))
+        self.a_mark_explore.setIcon(make_dots_icon([theme.mark_explore]))
+        self.a_mark_problem.setIcon(make_dots_icon([theme.mark_problem]))
+        self.a_mark_clear.setIcon(make_dots_icon([theme.guide]))
+        self.a_mark_menu.setIcon(make_dots_icon(
+            [theme.mark_checked, theme.mark_explore, theme.mark_problem]))
 
     def _build_statusbar(self) -> None:
         sb = self.statusBar()
@@ -1830,6 +2043,7 @@ class MainWindow(QMainWindow):
         self._add_recent(self.path)
         self._update_title()
         self.statusBar().showMessage(f"Opened {self.path}", 4000)
+        self._load_marks(self.path)          # after "Opened", so a warning stays visible
         return True
 
     def save(self) -> bool:
@@ -1866,7 +2080,59 @@ class MainWindow(QMainWindow):
         self._add_recent(self.path)
         self._update_title()
         self.statusBar().showMessage(f"Saved {self.path}", 4000)
+        self._save_marks(self.path)
         return True
+
+    # ---- status marks file (<file>.marks.json next to the .txt) ----------
+    @staticmethod
+    def marks_path(path: str) -> str:
+        return path + ".marks.json"
+
+    def _load_marks(self, path: str) -> None:
+        mp = self.marks_path(path)
+        if not os.path.isfile(mp):
+            return
+        by_name = {v: k for k, v in MARK_NAMES.items()}
+        try:
+            with open(mp, encoding="utf-8") as f:
+                data = json.load(f)
+            entries = []
+            for item in data.get("marks", []):
+                key = tuple((str(name), int(nth)) for name, nth in item["path"])
+                mark = by_name.get(item.get("mark"))
+                if key and mark:
+                    entries.append((key, mark))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as ex:
+            self.statusBar().showMessage(f"Colour marks could not be read ({ex}); "
+                                         "the tree itself is fine.", 8000)
+            return
+        self.editor.load_marks(entries)
+
+    def _save_marks(self, path: str) -> bool:
+        mp = self.marks_path(path)
+        entries = self.editor.export_marks()
+        try:
+            if not entries:
+                if os.path.isfile(mp):
+                    os.remove(mp)
+                return True
+            data = {"app": APP_NAME, "version": 1, "file": os.path.basename(path),
+                    "marks": [{"path": [[name, nth] for name, nth in key],
+                               "mark": MARK_NAMES[m]} for key, m in entries]}
+            f = QSaveFile(mp)
+            if not f.open(QIODevice.OpenModeFlag.WriteOnly):
+                raise OSError(f.errorString())
+            f.write(QByteArray(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")))
+            if not f.commit():
+                raise OSError(f.errorString())
+            return True
+        except OSError as ex:
+            self.statusBar().showMessage(f"Colour marks could not be saved: {ex}", 8000)
+            return False
+
+    def _marks_changed(self) -> None:
+        if self.path:                    # marks are stored right away
+            self._save_marks(self.path)
 
     # ---- recent files ----------------------------------------------------
     def _recent(self) -> List[str]:
@@ -1936,6 +2202,9 @@ class MainWindow(QMainWindow):
             ("New item (same level)", "Enter at end of name  or  Ctrl+Enter"),
             ("New sub-item", "Ctrl+Shift+Enter"),
             ("Insert empty line (vertical lines kept)", "Alt+Enter"),
+            ("Colour marks (names only)", ""),
+            ("Checked (green) / To explore (orange)", "Alt+G / Alt+O"),
+            ("Problem (red) / Remove mark", "Alt+R / Alt+C  (same key again also removes)"),
             ("Move right / left one level", "Tab / Shift+Tab  (or Alt+Shift+→ / ←)"),
             ("Move up / down", "Alt+Shift+↑ / ↓"),
             ("Edit name & explanation", f"{EDIT_SHORTCUT}  (explanation only: Ctrl+E)"),
