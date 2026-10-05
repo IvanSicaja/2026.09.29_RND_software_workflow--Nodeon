@@ -239,5 +239,44 @@ class NodeKeys(unittest.TestCase):
         self.assertEqual(tm.node_keys(doc)[id(a)], before)
 
 
+
+class WordSpans(unittest.TestCase):
+    def test_line_segments(self):
+        t = "│   ├── 01_media/                 # Organized media resources"
+        segs = {k: t[s:e] for k, s, e in tm.line_segments(t)}
+        self.assertEqual(segs, {"name": "01_media/", "comment": "Organized media resources"})
+        t = "│                                 # second line  "
+        self.assertEqual([t[s:e] for _, s, e in tm.line_segments(t)], ["second line"])
+        self.assertEqual(tm.line_segments("│   │"), [])
+        self.assertEqual(tm.line_segments("├── "), [])
+        t = "|-- a b   # c"
+        self.assertEqual([t[s:e] for _, s, e in tm.line_segments(t)], ["a b", "c"])
+
+    def test_add_merge_subtract(self):
+        text = "Organized media resources"
+        sp = tm.add_span([], "c0", 0, 9, 1, text)                 # Organized
+        sp = tm.add_span(sp, "c0", 9, 15, 1, text)                # touching, same colour
+        self.assertEqual(sp, [("c0", 0, 15, 1, "Organized media")])
+        sp = tm.add_span(sp, "c0", 10, 15, 3, text)               # recolour "media"
+        self.assertEqual(sorted(sp), [("c0", 0, 10, 1, "Organized "), ("c0", 10, 15, 3, "media")])
+        sp = tm.subtract_range(sp, "c0", 2, 12)
+        self.assertEqual(sorted(sp), [("c0", 0, 2, 1, "Or"), ("c0", 12, 15, 3, "dia")])
+        sp = tm.add_span(sp, "name", 0, 3, 2, "abcdef")           # other segment untouched
+        self.assertEqual(len(sp), 3)
+
+    def test_is_covered(self):
+        sp = [("c0", 0, 5, 1, "aaaaa"), ("c0", 5, 9, 1, "bbbb"), ("c0", 9, 12, 2, "ccc")]
+        self.assertTrue(tm.is_covered(sp, "c0", 1, 9, 1))
+        self.assertFalse(tm.is_covered(sp, "c0", 1, 10, 1))
+        self.assertFalse(tm.is_covered(sp, "name", 0, 1, 1))
+
+    def test_resolve_follows_text(self):
+        sp = ("c0", 4, 9, 2, "media")
+        self.assertEqual(tm.resolve_span(sp, "the media x"), sp)
+        self.assertEqual(tm.resolve_span(sp, "new: the media x"), ("c0", 9, 14, 2, "media"))
+        self.assertEqual(tm.resolve_span(sp, "media x media"), ("c0", 0, 5, 2, "media"))
+        self.assertIsNone(tm.resolve_span(sp, "the medi_a x"))
+
+
 if __name__ == "__main__":
     unittest.main()

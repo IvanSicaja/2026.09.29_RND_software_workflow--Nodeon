@@ -613,3 +613,122 @@ def shift_comments(nodes: List[Node], direction: int, gap: int) -> int:
     for n in units:
         n.comment_col = max(min(cur[id(n)], target), mins[id(n)])
     return target
+
+
+# --------------------------------------------------------------------------- #
+# Coloured character ranges ("spans") inside names and explanations
+# --------------------------------------------------------------------------- #
+# A span lives in one *segment* of a branch: "name" (the branch name) or
+# "c0", "c1", ... (the 1st, 2nd, ... explanation line). start/end are relative
+# to the segment text, and the marked text is remembered so the colour can
+# follow the words if the text around them changes.
+Span = Tuple[str, int, int, int, str]          # (segment, start, end, mark, text)
+
+_LINE_GUIDES = "│| \t\xa0"
+
+
+def line_segments(text: str) -> List[Tuple[str, int, int]]:
+    """Positions of the name text and the explanation text in one line:
+    [("name", start, end), ("comment", start, end)] (empty parts omitted)."""
+    n = len(text)
+    i = 0
+    while i < n and text[i] in _LINE_GUIDES and not _CONNECTOR_RE.match(text, i):
+        i += 1
+    m = _CONNECTOR_RE.match(text, i)
+    if m:
+        i = m.end()
+    out: List[Tuple[str, int, int]] = []
+    rest = text[i:]
+    stripped = rest.lstrip()
+    if stripped.startswith("#"):
+        hash_pos = i + len(rest) - len(stripped)
+    else:
+        hm = _COMMENT_SPLIT_RE.search(rest)
+        hash_pos = i + hm.start() + 1 if hm else -1
+        name_end = hash_pos if hash_pos >= 0 else n
+        ns = i
+        while ns < name_end and text[ns] in " \t":
+            ns += 1
+        ne = name_end
+        while ne > ns and text[ne - 1] in " \t":
+            ne -= 1
+        if ne > ns:
+            out.append(("name", ns, ne))
+    if hash_pos >= 0:
+        cs = hash_pos + 1
+        while cs < n and text[cs] in " \t":
+            cs += 1
+        ce = n
+        while ce > cs and text[ce - 1] in " \t":
+            ce -= 1
+        if ce > cs:
+            out.append(("comment", cs, ce))
+    return out
+
+
+def subtract_range(spans: List[Span], seg: str, a: int, b: int) -> List[Span]:
+    """Remove the range [a, b) of segment `seg` from the spans (cutting spans
+    that only partly overlap)."""
+    out: List[Span] = []
+    for sp in spans:
+        sg, s, e, mark, text = sp
+        if sg != seg or e <= a or s >= b:
+            out.append(sp)
+            continue
+        if s < a:
+            out.append((sg, s, a, mark, text[: a - s]))
+        if e > b:
+            out.append((sg, b, e, mark, text[b - s:]))
+    return out
+
+
+def add_span(spans: List[Span], seg: str, a: int, b: int, mark: int,
+             seg_text: str) -> List[Span]:
+    """Colour [a, b) of a segment (replacing whatever was there) and merge it
+    with touching spans of the same colour."""
+    a, b = max(0, a), min(len(seg_text), b)
+    out = subtract_range(spans, seg, a, b)
+    if b <= a:
+        return out
+    same = sorted([sp for sp in out if sp[0] == seg] + [(seg, a, b, mark, seg_text[a:b])],
+                  key=lambda sp: sp[1])
+    merged: List[Span] = []
+    for sp in same:
+        if merged and merged[-1][3] == sp[3] and sp[1] <= merged[-1][2]:
+            _, s, e, m, _ = merged[-1]
+            e = max(e, sp[2])
+            merged[-1] = (seg, s, e, m, seg_text[s:e])
+        else:
+            merged.append(sp)
+    return [sp for sp in out if sp[0] != seg] + merged
+
+
+def is_covered(spans: List[Span], seg: str, a: int, b: int, mark: int) -> bool:
+    """True if every character of [a, b) already has colour `mark`."""
+    pos = a
+    for _, s, e, _, _ in sorted((sp for sp in spans if sp[0] == seg and sp[3] == mark),
+                                key=lambda sp: sp[1]):
+        if s > pos:
+            break
+        pos = max(pos, e)
+        if pos >= b:
+            return True
+    return pos >= b
+
+
+def resolve_span(span: Span, seg_text: str) -> Optional[Span]:
+    """Find the span's text in the (possibly edited) segment: at the same place,
+    or else the nearest occurrence. None if the words are gone."""
+    seg, s, e, mark, text = span
+    if not text:
+        return None
+    if seg_text[s:e] == text:
+        return span
+    best, i = None, seg_text.find(text)
+    while i >= 0:
+        if best is None or abs(i - s) < abs(best - s):
+            best = i
+        i = seg_text.find(text, i + 1)
+    if best is None:
+        return None
+    return (seg, best, best + len(text), mark, text)

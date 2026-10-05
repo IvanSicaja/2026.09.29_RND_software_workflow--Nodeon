@@ -385,9 +385,169 @@ class GuiTests(unittest.TestCase):
         labels = {b._label: b for b in self.win.findChildren(app_module.ActionButton)}
         self.assertIn("Mark", labels)
         self.assertEqual(labels["Mark"]._keys(), "Alt+G / O / R")
-        self.assertEqual(len(labels["Mark"].menu().actions()), 4)
+        menu = [a for a in labels["Mark"].menu().actions() if not a.isSeparator()]
+        self.assertEqual(len(menu), 8)
         self.assertEqual([app_module.shortcut_text(a) for a in self.win.mark_actions],
                          ["Alt+G", "Alt+O", "Alt+R", "Alt+C"])
+
+    # coloured words (selection only) -----------------------------------------
+    def select(self, line, start_text, end_text=None, end_line=None):
+        """Select from start_text in `line` to the end of end_text (in end_line)."""
+        doc = self.ed.document()
+        b1 = doc.findBlockByNumber(line)
+        b2 = doc.findBlockByNumber(line if end_line is None else end_line)
+        end_text = end_text or start_text
+        cur = QTextCursor(doc)
+        cur.setPosition(b1.position() + b1.text().index(start_text))
+        cur.setPosition(b2.position() + b2.text().index(end_text) + len(end_text),
+                        QTextCursor.MoveMode.KeepAnchor)
+        self.ed.setTextCursor(cur)
+
+    def colors_of(self, line, text):
+        """Colour of every character of `text` in `line`."""
+        block = self.ed.document().findBlockByNumber(line)
+        start = block.text().index(text)
+        out = []
+        for pos in range(start, start + len(text)):
+            col = None
+            for r in block.layout().formats():
+                if r.start <= pos < r.start + r.length:
+                    col = r.format.foreground().color().name()
+            out.append(col)
+        return out
+
+    def c(self, attr):
+        return QColor(getattr(self.ed.theme, attr)).name()
+
+    def test_word_colour_only_selection(self):
+        before = self.ed.toPlainText()
+        self.select(2, "Source")                              # "# Source code"
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(2, "Source")), {self.c("mark_checked")})
+        self.assertEqual(set(self.colors_of(2, " code")), {self.c("comment")})
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.c("folder")})
+        self.assertEqual(self.ed.toPlainText(), before)
+        self.assertTrue(self.ed.textCursor().hasSelection())    # selection kept
+
+    def test_word_colour_part_of_name_and_all_colours(self):
+        self.select(3, "main")                                 # part of "main.py"
+        self.key(K.Key_O, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(3, "main")), {self.c("mark_explore")})
+        self.assertEqual(set(self.colors_of(3, ".py")), {self.c("file")})
+        self.select(7, "Overview")
+        self.key(K.Key_R, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(7, "Overview")), {self.c("mark_problem")})
+
+    def test_word_colour_never_touches_tree_lines(self):
+        self.select(2, "├──", "Source")                        # lines + name + spaces + #
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(2, "├──")), {self.c("guide")})
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.c("mark_checked")})
+        self.assertEqual(set(self.colors_of(2, "Source")), {self.c("mark_checked")})
+        self.assertEqual(self.colors_of(2, "#")[0], self.c("comment"))
+
+    def test_word_colour_over_several_lines(self):
+        self.select(5, "Documentation", "second", end_line=6)
+        self.key(K.Key_R, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(5, "Documentation")), {self.c("mark_problem")})
+        self.assertEqual(set(self.colors_of(6, "second")), {self.c("mark_problem")})
+        self.assertEqual(set(self.colors_of(6, " line")), {self.c("comment")})
+
+    def test_word_toggle_and_partial_remove(self):
+        self.select(2, "Source code")
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.select(2, "Source code")
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)     # same again = remove
+        self.assertEqual(set(self.colors_of(2, "Source code")), {self.c("comment")})
+        self.select(2, "Source code")
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.select(2, "code")
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)     # remove just "code"
+        self.assertEqual(set(self.colors_of(2, "Source")), {self.c("mark_checked")})
+        self.assertEqual(set(self.colors_of(2, "code")), {self.c("comment")})
+
+    def test_word_needs_selection(self):
+        self.goto(2)
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.assertIn("Select the words", self.win.statusBar().currentMessage())
+        self.assertEqual(self.ed.export_spans(), [])
+
+    def test_word_and_line_mark_together(self):
+        self.mark(2, K.Key_R)                                  # whole name red
+        self.select(2, "Source")
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.c("mark_problem")})
+        self.assertEqual(set(self.colors_of(2, "Source")), {self.c("mark_checked")})
+
+    def test_word_follows_alignment_moves_and_edits(self):
+        self.select(5, "Documentation")
+        self.key(K.Key_O, M.AltModifier | M.ShiftModifier)
+        self.goto(0)
+        for _ in range(3):
+            self.key(K.Key_Right, M.AltModifier)                # explanations move
+        self.assertEqual(set(self.colors_of(5, "Documentation")), {self.c("mark_explore")})
+        self.goto(5)
+        self.key(K.Key_Up, M.AltModifier | M.ShiftModifier)    # move branch up
+        line = [i for i, l in enumerate(self.lines()) if "Documentation" in l][0]
+        self.assertEqual(set(self.colors_of(line, "Documentation")), {self.c("mark_explore")})
+        # typing earlier in the line: colour stays on the word
+        b = self.ed.document().findBlockByNumber(line)
+        cur = QTextCursor(b)
+        cur.setPosition(b.position() + b.text().index("docs/") + 4)
+        self.ed.setTextCursor(cur)
+        QTest.keyClicks(self.ed, "_v2")
+        QTest.qWait(300)
+        self.assertIn("docs_v2/", self.lines()[line])
+        self.assertEqual(set(self.colors_of(line, "Documentation")), {self.c("mark_explore")})
+
+    def test_word_gone_when_edited_back_with_undo(self):
+        self.select(7, "Overview")
+        self.key(K.Key_R, M.AltModifier | M.ShiftModifier)
+        b = self.ed.document().findBlockByNumber(7)
+        cur = QTextCursor(b)
+        cur.setPosition(b.position() + b.text().index("Overview") + 4)
+        self.ed.setTextCursor(cur)
+        QTest.keyClicks(self.ed, "X")                           # "OverXview"
+        QTest.qWait(300)
+        self.assertEqual(set(self.colors_of(7, "OverXview")), {self.c("comment")})
+        self.key(K.Key_Z, M.ControlModifier)
+        QTest.qWait(300)
+        self.assertEqual(set(self.colors_of(7, "Overview")), {self.c("mark_problem")})
+
+    def test_word_colours_saved_and_reloaded(self):
+        self.select(2, "Source")
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.select(6, "second")
+        self.key(K.Key_O, M.AltModifier | M.ShiftModifier)
+        marks_file = self.path + ".marks.json"
+        with open(marks_file, encoding="utf-8") as f:
+            data = __import__("json").load(f)
+        self.assertEqual(sorted(w["text"] for w in data["words"]), ["Source", "second"])
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), SAMPLE + "\n")          # .txt untouched
+        self.win.close()
+        win2 = app_module.MainWindow(self.path)
+        try:
+            ed, old = win2.editor, self.ed
+            self.ed = ed
+            self.assertEqual(set(self.colors_of(2, "Source")), {self.c("mark_checked")})
+            self.assertEqual(set(self.colors_of(6, "second")), {self.c("mark_explore")})
+            # removing all colours deletes the marks file
+            for line, word in ((2, "Source"), (6, "second")):
+                self.select(line, word)
+                ed.mark_words(app_module.MARK_NONE)
+            self.assertFalse(os.path.exists(marks_file))
+        finally:
+            self.ed = old
+            win2.editor.document().setModified(False)
+            win2.close()
+
+    def test_word_colour_hidden_lines_and_folding(self):
+        self.select(3, "Entry")
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.ed.toggle_fold(2)
+        self.ed.toggle_fold(2)
+        self.assertEqual(set(self.colors_of(3, "Entry")), {self.c("mark_checked")})
 
     # existing behaviour still works ------------------------------------
     def test_folding_levels(self):

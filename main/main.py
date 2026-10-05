@@ -47,7 +47,8 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBo
 # --------------------------------------------------------------------------- #
 REQUIRED_MODEL_NAMES = ("FormatOptions", "Node", "TreeDocument", "TreeError", "parse",
                         "render", "format_text", "shift_comments", "insert_spacer",
-                        "node_after_subtree", "node_keys")
+                        "node_after_subtree", "node_keys", "line_segments", "add_span",
+                        "subtract_range", "is_covered", "resolve_span")
 
 
 class ModelLoadError(Exception):
@@ -249,6 +250,8 @@ class TreeHighlighter(QSyntaxHighlighter):
 
     def __init__(self, document, theme: Theme) -> None:
         super().__init__(document)
+        # Returns [(start, end, mark, bold)] of coloured words for a line number.
+        self.span_provider: Callable[[int], list] = lambda line: ()
         self.set_theme(theme, rehighlight=False)
 
     def set_theme(self, theme: Theme, rehighlight: bool = True) -> None:
@@ -286,6 +289,7 @@ class TreeHighlighter(QSyntaxHighlighter):
         stripped = rest.lstrip()
         if stripped.startswith("#"):
             self.setFormat(i + len(rest) - len(stripped), n, self.f_comment)
+            self._paint_spans(n)
             return
         hm = self._HASH.search(rest)
         c = i + hm.start() + 1 if hm else n
@@ -301,6 +305,13 @@ class TreeHighlighter(QSyntaxHighlighter):
             self.setFormat(start, len(name), fmt)
         if hm:
             self.setFormat(c, n - c, self.f_comment)
+        self._paint_spans(n)
+
+    def _paint_spans(self, n: int) -> None:
+        for start, end, mark, bold in self.span_provider(self.currentBlock().blockNumber()):
+            start, end = max(0, start), min(n, end)
+            if end > start:
+                self.setFormat(start, end - start, self.f_marks[(mark, bold)])
 
 
 # --------------------------------------------------------------------------- #
@@ -340,12 +351,18 @@ class TreeEditor(QPlainTextEdit):
         # Status marks by node key; the line states are the live copy, this
         # registry restores marks after Undo and is what gets saved.
         self.marks: Dict[tm.NodeKey, int] = {}
+        # Coloured words: node key -> spans (see treemodel.Span).
+        self.spans: Dict[tm.NodeKey, List[tm.Span]] = {}
+        self._visible_spans: Dict[tm.NodeKey, List[tm.Span]] = {}
+        self._line_spans: Dict[int, List[Tuple[int, int, int, bool]]] = {}
+        self._line_keys: List[Optional[tm.NodeKey]] = []
         self.context_actions: List[Optional[QAction]] = []
 
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.setFrameShape(QPlainTextEdit.Shape.NoFrame)
         self.gutter = FoldGutter(self)
         self.highlighter = TreeHighlighter(self.document(), self.theme)
+        self.highlighter.span_provider = lambda line: self._line_spans.get(line, ())
         self.set_font_size(DEFAULT_FONT_SIZE)
 
         self._timer = QTimer(self)
@@ -396,6 +413,10 @@ class TreeEditor(QPlainTextEdit):
     # ---- document ----------------------------------------------------------
     def set_document_text(self, text: str) -> None:
         self.marks = {}
+        self.spans = {}
+        self._visible_spans = {}
+        self._line_spans = {}
+        self._line_keys = []
         self.setPlainText(text)
         self.document().clearUndoRedoStacks()
         self.refresh(force=True)
@@ -422,11 +443,21 @@ class TreeEditor(QPlainTextEdit):
 
     def refresh(self, force: bool = False) -> None:
         if force or not self._rev_ok():
+            old_keys = self._line_keys
             self._model, self._map = tm.parse(self.toPlainText())
             self._ranges = self._map.fold_ranges()
             self._parsed_rev = self.document().revision()
+            new_keys = self._compute_line_keys()
+            if len(old_keys) == len(new_keys):
+                # Same lines, some names typed differently: keep their colours.
+                old_set, new_set = set(old_keys), set(new_keys)
+                self._migrate_keys([(o, n) for o, n in zip(old_keys, new_keys)
+                                    if o is not None and n is not None and o != n
+                                    and o not in new_set and n not in old_set])
+            self._line_keys = new_keys
             self._apply_folds()
             self._sync_marks()
+            self._resolve_spans()
             return
         self._apply_folds()
 
@@ -632,6 +663,8 @@ class TreeEditor(QPlainTextEdit):
             return False
         collapsed_nodes = [self._map.nodes[h] for h in self.collapsed_headers()]
         marked_nodes = self._marked_nodes()
+        nodes_before = list(self._model.iter_nodes())      # keeps ids valid
+        keys_before = tm.node_keys(self._model)
         vscroll = self.verticalScrollBar().value()
         try:
             focus, mode = op(node)
@@ -654,8 +687,13 @@ class TreeEditor(QPlainTextEdit):
                 collapsed.discard(lm.line_of(a))
                 a = a.parent
         self._apply_folds(collapsed)
+        keys_after = tm.node_keys(self._model)
+        self._migrate_keys([(keys_before[id(n)], keys_after[id(n)]) for n in nodes_before
+                            if id(n) in keys_after and keys_before[id(n)] != keys_after[id(n)]])
+        self._line_keys = self._compute_line_keys()
         self._sync_marks({lm.line_of(n): m for n, m in marked_nodes
                           if lm.line_of(n) is not None})
+        self._resolve_spans()
         self.verticalScrollBar().setValue(vscroll)
         if focus is not None and lm.line_of(focus) is not None:
             self._place_cursor(focus, mode, offset)
@@ -796,10 +834,151 @@ class TreeEditor(QPlainTextEdit):
         keys = tm.node_keys(self._model)
         return [(keys[id(n)], m) for n, m in self._marked_nodes()]
 
-    def load_marks(self, entries: List[Tuple[tm.NodeKey, int]]) -> None:
+    def load_marks(self, entries: List[Tuple[tm.NodeKey, int]],
+                   spans: Optional[List[Tuple[tm.NodeKey, tm.Span]]] = None) -> None:
         self.ensure_parsed()
         self.marks = {key: m for key, m in entries if m in MARK_NAMES}
+        self.spans = {}
+        for key, sp in spans or []:
+            if sp[3] in MARK_NAMES and sp[2] > sp[1]:
+                self.spans.setdefault(key, []).append(sp)
         self._sync_marks()
+        self._resolve_spans()
+
+    # ---- coloured words (selection only) ---------------------------------
+    def _compute_line_keys(self) -> List[Optional[tm.NodeKey]]:
+        keys = tm.node_keys(self._model)
+        return [keys.get(id(n)) if (n is not None and k in (tm.KIND_NODE, tm.KIND_COMMENT))
+                else None for k, n in zip(self._map.kinds, self._map.nodes)]
+
+    def _migrate_keys(self, pairs: List[Tuple[tm.NodeKey, tm.NodeKey]]) -> None:
+        """A branch got a new key (renamed / moved to another level): carry its
+        marks and coloured words over to the new key."""
+        if not pairs:
+            return
+        for reg in (self.marks, self.spans):
+            moved = {new: reg[old] for old, new in pairs if old in reg}
+            for old, _ in pairs:
+                reg.pop(old, None)
+            reg.update(moved)
+
+    def _line_segments(self, line: int, text: str, comment_no: Dict[int, int]):
+        """[(node, segment id, start, end, bold)] for one line."""
+        kind = self._map.kinds[line] if line < len(self._map) else None
+        node = self._map.nodes[line] if line < len(self._map) else None
+        if node is None or kind not in (tm.KIND_NODE, tm.KIND_COMMENT):
+            return []
+        out = []
+        for part, s, e in tm.line_segments(text):
+            if kind == tm.KIND_NODE:
+                seg = "name" if part == "name" else "c0"
+            elif part == "comment":
+                seg = f"c{comment_no.get(line, 1)}"
+            else:
+                continue
+            out.append((node, seg, s, e, seg == "name" and node.name.endswith(("/", "\\"))))
+        return out
+
+    def _comment_numbers(self) -> Dict[int, int]:
+        """line -> number of the explanation line (1, 2, ...) for continuation lines."""
+        out: Dict[int, int] = {}
+        count: Dict[int, int] = {}
+        for i, (k, n) in enumerate(zip(self._map.kinds, self._map.nodes)):
+            if k == tm.KIND_COMMENT and n is not None:
+                count[id(n)] = count.get(id(n), 0) + 1
+                out[i] = count[id(n)]
+        return out
+
+    def _resolve_spans(self) -> None:
+        """Place every coloured word on its line again (after edits, moves,
+        undo) and repaint the lines whose colours changed."""
+        doc = self.document()
+        keys = tm.node_keys(self._model)
+        wanted = {k for k, v in self.spans.items() if v}
+        new_lines: Dict[int, List[Tuple[int, int, int, bool]]] = {}
+        visible: Dict[tm.NodeKey, List[tm.Span]] = {}
+        if wanted:
+            numbers = self._comment_numbers()
+            n_lines = min(len(self._map), doc.blockCount())
+            for line in range(n_lines):
+                node = self._map.nodes[line]
+                if node is None or keys.get(id(node)) not in wanted:
+                    continue
+                key = keys[id(node)]
+                text = self._block(line).text()
+                for _n, seg, s, e, bold in self._line_segments(line, text, numbers):
+                    seg_text = text[s:e]
+                    resolved = []
+                    for sp in self.spans[key]:
+                        if sp[0] != seg:
+                            continue
+                        r = tm.resolve_span(sp, seg_text)
+                        if r is not None:
+                            resolved.append(r)
+                            new_lines.setdefault(line, []).append(
+                                (u16len(text[:s + r[1]]), u16len(text[:s + r[2]]), r[3], bold))
+                    if resolved:
+                        visible.setdefault(key, []).extend(resolved)
+            # Keep positions up to date; words that are gone stay remembered
+            # (so Undo brings them back) but are not shown or saved.
+            for key, found in visible.items():
+                found_ids = {(sp[0], sp[4]) for sp in found}
+                self.spans[key] = found + [sp for sp in self.spans[key]
+                                           if (sp[0], sp[4]) not in found_ids]
+        old_lines = self._line_spans
+        self._line_spans = new_lines
+        self._visible_spans = visible
+        for line in set(old_lines) | set(new_lines):
+            if old_lines.get(line) != new_lines.get(line) and line < doc.blockCount():
+                self.highlighter.rehighlightBlock(self._block(line))
+
+    def mark_words(self, mark: int) -> None:
+        """Colour only the selected characters (names and explanations; the
+        tree lines are never coloured). Same colour again removes it."""
+        self.ensure_parsed()
+        cur = self.textCursor()
+        if not cur.hasSelection():
+            self.statusMessage.emit("Select the words to colour first "
+                                    "(Alt+G / O / R colour the whole name)")
+            return
+        doc = self.document()
+        a, b = sorted((cur.anchor(), cur.position()))
+        first, last = doc.findBlock(a).blockNumber(), doc.findBlock(b).blockNumber()
+        keys = tm.node_keys(self._model)
+        numbers = self._comment_numbers()
+        pieces = []
+        for line in range(first, last + 1):
+            block = self._block(line)
+            text = block.text()
+            la = u16_to_cp(text, max(a, block.position()) - block.position())
+            lb = u16_to_cp(text, min(b, block.position() + u16len(text)) - block.position())
+            for node, seg, s, e, _bold in self._line_segments(line, text, numbers):
+                x, y = max(s, la), min(e, lb)
+                if x < y:
+                    pieces.append((keys[id(node)], seg, x - s, y - s, text[s:e]))
+        if not pieces:
+            self.statusMessage.emit("The selection contains no name or explanation text")
+            return
+        if mark and all(tm.is_covered(self.spans.get(k, []), seg, x, y, mark)
+                        for k, seg, x, y, _t in pieces):
+            mark = MARK_NONE                                  # same key again = remove
+        for key, seg, x, y, seg_text in pieces:
+            lst = tm.subtract_range(self.spans.get(key, []), seg, x, y)
+            if mark:
+                lst = tm.add_span(lst, seg, x, y, mark, seg_text)
+            if lst:
+                self.spans[key] = lst
+            else:
+                self.spans.pop(key, None)
+        self._resolve_spans()
+        self.statusMessage.emit(f"Selected text: {MARK_LABELS[mark]}" if mark
+                                else "Selected text: colour removed")
+        self.marksChanged.emit()
+
+    def export_spans(self) -> List[Tuple[tm.NodeKey, tm.Span]]:
+        self.ensure_parsed()
+        self._resolve_spans()
+        return [(key, sp) for key, lst in self._visible_spans.items() for sp in lst]
 
     def insert_spacer(self) -> None:
         """Alt+Enter: insert an empty line below the current line. The vertical
@@ -1808,12 +1987,29 @@ class MainWindow(QMainWindow):
                                 "(press again to remove)")
         self.a_mark_clear = A("Remove mark", lambda: e.mark_selection(MARK_NONE), "Alt+C",
                               "Remove the colour mark from the name")
+        self.a_word_checked = A("Colour selected text: checked", lambda: e.mark_words(MARK_CHECKED),
+                                "Alt+Shift+G", "Colour only the selected characters green "
+                                "(press again to remove)")
+        self.a_word_explore = A("Colour selected text: to explore",
+                                lambda: e.mark_words(MARK_EXPLORE), "Alt+Shift+O",
+                                "Colour only the selected characters orange "
+                                "(press again to remove)")
+        self.a_word_problem = A("Colour selected text: problem",
+                                lambda: e.mark_words(MARK_PROBLEM), "Alt+Shift+R",
+                                "Colour only the selected characters red "
+                                "(press again to remove)")
+        self.a_word_clear = A("Remove colour from selected text", lambda: e.mark_words(MARK_NONE),
+                              "Alt+Shift+C", "Remove the colour from the selected characters")
         self.mark_actions = [self.a_mark_checked, self.a_mark_explore, self.a_mark_problem,
                              self.a_mark_clear]
+        self.word_actions = [self.a_word_checked, self.a_word_explore, self.a_word_problem,
+                             self.a_word_clear]
         self.a_mark_menu = QAction("Mark", self)
         self.a_mark_menu.setToolTip("Mark branch names (selected lines or the line at the "
                                     "cursor): Checked Alt+G · To explore Alt+O · "
-                                    "Problem Alt+R · Remove Alt+C")
+                                    "Problem Alt+R · Remove Alt+C\n"
+                                    "Colour only the selected text: add Shift "
+                                    "(Alt+Shift+G / O / R / C)")
 
         self.a_zoom_in = A("Zoom in", lambda: self._zoom(1), ["Ctrl+=", "Ctrl++"])
         self.a_zoom_out = A("Zoom out", lambda: self._zoom(-1), "Ctrl+-")
@@ -1829,7 +2025,7 @@ class MainWindow(QMainWindow):
                              self.a_add_child, self.a_spacer, self.a_duplicate, self.a_delete, None,
                              self.a_up, self.a_down, self.a_left, self.a_right, None,
                              self.a_toggle, self.a_collapse_branch, self.a_expand_branch, None,
-                             *self.mark_actions]
+                             *self.mark_actions, None, *self.word_actions]
 
     def _build_menus(self) -> None:
         mb = self.menuBar()
@@ -1856,6 +2052,8 @@ class MainWindow(QMainWindow):
         m.addActions([self.a_expl_left, self.a_expl_right, self.a_format])
         m.addSeparator()
         m.addActions(self.mark_actions)
+        m.addSeparator()
+        m.addActions(self.word_actions)
 
         m = mb.addMenu("&View")
         m.addActions([self.a_collapse_all, self.a_collapse_level, self.a_expand_level,
@@ -1896,6 +2094,8 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         self.mark_menu = QMenu(self)
         self.mark_menu.addActions(self.mark_actions)
+        self.mark_menu.addSeparator()
+        self.mark_menu.addActions(self.word_actions)
         mark_btn = ActionButton(self.a_mark_menu, "Mark", caption="Alt+G / O / R")
         mark_btn.setMenu(self.mark_menu)
         mark_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -1944,6 +2144,10 @@ class MainWindow(QMainWindow):
         self.a_mark_explore.setIcon(make_dots_icon([theme.mark_explore]))
         self.a_mark_problem.setIcon(make_dots_icon([theme.mark_problem]))
         self.a_mark_clear.setIcon(make_dots_icon([theme.guide]))
+        self.a_word_checked.setIcon(make_dots_icon([theme.mark_checked]))
+        self.a_word_explore.setIcon(make_dots_icon([theme.mark_explore]))
+        self.a_word_problem.setIcon(make_dots_icon([theme.mark_problem]))
+        self.a_word_clear.setIcon(make_dots_icon([theme.guide]))
         self.a_mark_menu.setIcon(make_dots_icon(
             [theme.mark_checked, theme.mark_explore, theme.mark_problem]))
 
@@ -2102,23 +2306,36 @@ class MainWindow(QMainWindow):
                 mark = by_name.get(item.get("mark"))
                 if key and mark:
                     entries.append((key, mark))
+            spans = []
+            for item in data.get("words", []):
+                key = tuple((str(name), int(nth)) for name, nth in item["path"])
+                mark = by_name.get(item.get("mark"))
+                part = str(item["part"])
+                start, end, text = int(item["start"]), int(item["end"]), str(item["text"])
+                if key and mark and (part == "name" or re.fullmatch(r"c\d+", part)) \
+                        and 0 <= start < end and len(text) == end - start:
+                    spans.append((key, (part, start, end, mark, text)))
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as ex:
             self.statusBar().showMessage(f"Colour marks could not be read ({ex}); "
                                          "the tree itself is fine.", 8000)
             return
-        self.editor.load_marks(entries)
+        self.editor.load_marks(entries, spans)
 
     def _save_marks(self, path: str) -> bool:
         mp = self.marks_path(path)
         entries = self.editor.export_marks()
+        spans = self.editor.export_spans()
         try:
-            if not entries:
+            if not entries and not spans:
                 if os.path.isfile(mp):
                     os.remove(mp)
                 return True
             data = {"app": APP_NAME, "version": 1, "file": os.path.basename(path),
                     "marks": [{"path": [[name, nth] for name, nth in key],
-                               "mark": MARK_NAMES[m]} for key, m in entries]}
+                               "mark": MARK_NAMES[m]} for key, m in entries],
+                    "words": [{"path": [[name, nth] for name, nth in key], "part": sp[0],
+                               "start": sp[1], "end": sp[2], "text": sp[4],
+                               "mark": MARK_NAMES[sp[3]]} for key, sp in spans]}
             f = QSaveFile(mp)
             if not f.open(QIODevice.OpenModeFlag.WriteOnly):
                 raise OSError(f.errorString())
@@ -2205,6 +2422,7 @@ class MainWindow(QMainWindow):
             ("Colour marks (names only)", ""),
             ("Checked (green) / To explore (orange)", "Alt+G / Alt+O"),
             ("Problem (red) / Remove mark", "Alt+R / Alt+C  (same key again also removes)"),
+            ("Colour only the selected text", "Alt+Shift+G / O / R,  remove: Alt+Shift+C"),
             ("Move right / left one level", "Tab / Shift+Tab  (or Alt+Shift+→ / ←)"),
             ("Move up / down", "Alt+Shift+↑ / ↓"),
             ("Edit name & explanation", f"{EDIT_SHORTCUT}  (explanation only: Ctrl+E)"),
