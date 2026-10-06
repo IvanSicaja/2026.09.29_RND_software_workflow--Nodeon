@@ -129,6 +129,10 @@ COLLAPSED = 1                      # QTextBlock.userState() bit of a folded bran
 MARK_NONE, MARK_CHECKED, MARK_EXPLORE, MARK_PROBLEM = 0, 1, 2, 3
 MARK_NAMES = {MARK_CHECKED: "checked", MARK_EXPLORE: "explore", MARK_PROBLEM: "problem"}
 MARK_LABELS = {MARK_CHECKED: "Checked", MARK_EXPLORE: "To explore", MARK_PROBLEM: "Problem"}
+# Word colours can also be "default": shows the normal text colour even inside a
+# name that has a whole-line colour.
+MARK_DEFAULT = 4
+SPAN_MARK_NAMES = {**MARK_NAMES, MARK_DEFAULT: "default"}
 _MARK_BITS = 0b110
 
 
@@ -311,7 +315,11 @@ class TreeHighlighter(QSyntaxHighlighter):
         for start, end, mark, bold in self.span_provider(self.currentBlock().blockNumber()):
             start, end = max(0, start), min(n, end)
             if end > start:
-                self.setFormat(start, end - start, self.f_marks[(mark, bold)])
+                if mark == MARK_DEFAULT:
+                    fmt = self.f_folder if bold else self.f_file
+                else:
+                    fmt = self.f_marks[(mark, bold)]
+                self.setFormat(start, end - start, fmt)
 
 
 # --------------------------------------------------------------------------- #
@@ -825,8 +833,18 @@ class TreeEditor(QPlainTextEdit):
                 self.marks.pop(key, None)
             if set_mark_bits(block, mark):
                 self.highlighter.rehighlightBlock(block)
+            # The line command decides the colour of the whole name again.
+            if key in self.spans:
+                rest = [sp for sp in self.spans[key]
+                        if not (sp[0] == "name" and sp[3] == MARK_DEFAULT)]
+                if rest:
+                    self.spans[key] = rest
+                else:
+                    del self.spans[key]
+        self._resolve_spans()
         what = f"{len(nodes)} branches" if len(nodes) > 1 else f"“{nodes[0].name or '(empty)'}”"
-        self.statusMessage.emit(f"{what}: {MARK_LABELS[mark]}" if mark else f"{what}: mark removed")
+        self.statusMessage.emit(f"{what}: {MARK_LABELS[mark]}" if mark
+                                else f"{what}: default colour")
         self.marksChanged.emit()
 
     def export_marks(self) -> List[Tuple[tm.NodeKey, int]]:
@@ -840,7 +858,7 @@ class TreeEditor(QPlainTextEdit):
         self.marks = {key: m for key, m in entries if m in MARK_NAMES}
         self.spans = {}
         for key, sp in spans or []:
-            if sp[3] in MARK_NAMES and sp[2] > sp[1]:
+            if sp[3] in SPAN_MARK_NAMES and sp[2] > sp[1]:
                 self.spans.setdefault(key, []).append(sp)
         self._sync_marks()
         self._resolve_spans()
@@ -959,25 +977,44 @@ class TreeEditor(QPlainTextEdit):
             for node, seg, s, e, _bold in self._line_segments(line, text, numbers):
                 x, y = max(s, la), min(e, lb)
                 if x < y:
-                    pieces.append((keys[id(node)], seg, x - s, y - s, text[s:e]))
+                    pieces.append((keys[id(node)], seg, x - s, y - s, text[s:e], node))
         if not pieces:
             self.statusMessage.emit("The selection contains no name or explanation text")
             return
         if mark and all(tm.is_covered(self.spans.get(k, []), seg, x, y, mark)
-                        for k, seg, x, y, _t in pieces):
+                        for k, seg, x, y, _t, _n in pieces):
             mark = MARK_NONE                                  # same key again = remove
-        for key, seg, x, y, seg_text in pieces:
+
+        def line_coloured(node: tm.Node, seg: str) -> bool:
+            h = self._map.line_of(node)
+            return seg == "name" and h is not None and mark_of(self._block(h)) != MARK_NONE
+
+        what = "Selected text" if cur.hasSelection() else "Word at cursor"
+        if mark == MARK_NONE:
+            # Default colour: drop word colours; inside a name that has a
+            # whole-line colour, store "default" so the normal colour shows.
+            def already_default(k, seg, x, y, node) -> bool:
+                if any(sp[0] == seg and sp[3] != MARK_DEFAULT and sp[1] < y and sp[2] > x
+                       for sp in self.spans.get(k, [])):
+                    return False
+                return (not line_coloured(node, seg)
+                        or tm.is_covered(self.spans.get(k, []), seg, x, y, MARK_DEFAULT))
+            if all(already_default(k, seg, x, y, n) for k, seg, x, y, _t, n in pieces):
+                self.statusMessage.emit(f"{what}: already in the default colour")
+                return
+        for key, seg, x, y, seg_text, node in pieces:
             lst = tm.subtract_range(self.spans.get(key, []), seg, x, y)
             if mark:
                 lst = tm.add_span(lst, seg, x, y, mark, seg_text)
+            elif line_coloured(node, seg):
+                lst = tm.add_span(lst, seg, x, y, MARK_DEFAULT, seg_text)
             if lst:
                 self.spans[key] = lst
             else:
                 self.spans.pop(key, None)
         self._resolve_spans()
-        what = "Selected text" if cur.hasSelection() else "Word at cursor"
         self.statusMessage.emit(f"{what}: {MARK_LABELS[mark]}" if mark
-                                else f"{what}: colour removed")
+                                else f"{what}: default colour")
         self.marksChanged.emit()
 
     def _word_at_cursor(self) -> Optional[Tuple[int, int]]:
@@ -2043,8 +2080,8 @@ class MainWindow(QMainWindow):
         self.a_mark_problem = A("Mark as problem", lambda: e.mark_selection(MARK_PROBLEM),
                                 "Alt+R", "Colour the name red: something is not OK "
                                 "(press again to remove)")
-        self.a_mark_clear = A("Remove mark", lambda: e.mark_selection(MARK_NONE), "Alt+C",
-                              "Remove the colour mark from the name")
+        self.a_mark_clear = A("Default colour (remove mark)", lambda: e.mark_selection(MARK_NONE),
+                              "Alt+C", "Give the whole name its default text colour again")
         self.a_word_checked = A("Colour word / selection: checked",
                                 lambda: e.mark_words(MARK_CHECKED), "Alt+Shift+G",
                                 "Colour the word at the cursor (or the selected characters) "
@@ -2057,10 +2094,10 @@ class MainWindow(QMainWindow):
                                 lambda: e.mark_words(MARK_PROBLEM), "Alt+Shift+R",
                                 "Colour the word at the cursor (or the selected characters) "
                                 "red - press again to remove")
-        self.a_word_clear = A("Remove colour from word / selection",
+        self.a_word_clear = A("Default colour for word / selection",
                               lambda: e.mark_words(MARK_NONE), "Alt+Shift+C",
-                              "Remove the colour from the word at the cursor "
-                              "(or the selected characters)")
+                              "Give the word at the cursor (or the selected characters) "
+                              "the default text colour again")
         self.mark_actions = [self.a_mark_checked, self.a_mark_explore, self.a_mark_problem,
                              self.a_mark_clear]
         self.word_actions = [self.a_word_checked, self.a_word_explore, self.a_word_problem,
@@ -2068,11 +2105,11 @@ class MainWindow(QMainWindow):
         self.a_mark_menu = QAction("Mark line", self)
         self.a_mark_menu.setToolTip("Mark line - colour the whole branch name (line at the "
                                     "cursor or selected lines):\nChecked Alt+G · To explore "
-                                    "Alt+O · Problem Alt+R · Remove Alt+C")
+                                    "Alt+O · Problem Alt+R · Default colour Alt+C")
         self.a_words_menu = QAction("Mark words", self)
         self.a_words_menu.setToolTip("Mark words - colour only the word at the cursor or the "
                                      "selected characters:\nChecked Alt+Shift+G · To explore "
-                                     "Alt+Shift+O · Problem Alt+Shift+R · Remove Alt+Shift+C")
+                                     "Alt+Shift+O · Problem Alt+Shift+R · Default colour Alt+Shift+C")
 
         self.a_zoom_in = A("Zoom in", lambda: self._zoom(1), ["Ctrl+=", "Ctrl++"])
         self.a_zoom_out = A("Zoom out", lambda: self._zoom(-1), "Ctrl+-")
@@ -2160,8 +2197,8 @@ class MainWindow(QMainWindow):
         self.words_menu = QMenu(self)
         self.words_menu.addActions(self.word_actions)
         for action, label, caption, menu in (
-                (self.a_mark_menu, "Mark line", "Alt+G/O/R", self.mark_menu),
-                (self.a_words_menu, "Mark words", "Alt+Shift+G/O/R", self.words_menu)):
+                (self.a_mark_menu, "Mark line", "Alt+G/O/R/C", self.mark_menu),
+                (self.a_words_menu, "Mark words", "Alt+Shift+G/O/R/C", self.words_menu)):
             btn = ActionButton(action, label, caption=caption)
             btn.setMenu(menu)
             btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -2209,11 +2246,11 @@ class MainWindow(QMainWindow):
         self.a_mark_checked.setIcon(make_dots_icon([theme.mark_checked]))
         self.a_mark_explore.setIcon(make_dots_icon([theme.mark_explore]))
         self.a_mark_problem.setIcon(make_dots_icon([theme.mark_problem]))
-        self.a_mark_clear.setIcon(make_dots_icon([theme.guide]))
+        self.a_mark_clear.setIcon(make_dots_icon([theme.fg]))       # default text colour
         self.a_word_checked.setIcon(make_dots_icon([theme.mark_checked]))
         self.a_word_explore.setIcon(make_dots_icon([theme.mark_explore]))
         self.a_word_problem.setIcon(make_dots_icon([theme.mark_problem]))
-        self.a_word_clear.setIcon(make_dots_icon([theme.guide]))
+        self.a_word_clear.setIcon(make_dots_icon([theme.fg]))
         marks3 = [theme.mark_checked, theme.mark_explore, theme.mark_problem]
         self.a_mark_menu.setIcon(make_mark_icon("line", marks3, theme.guide))
         self.a_words_menu.setIcon(make_mark_icon("words", marks3, theme.guide))
@@ -2374,9 +2411,10 @@ class MainWindow(QMainWindow):
                 if key and mark:
                     entries.append((key, mark))
             spans = []
+            span_by_name = {v: k for k, v in SPAN_MARK_NAMES.items()}
             for item in data.get("words", []):
                 key = tuple((str(name), int(nth)) for name, nth in item["path"])
-                mark = by_name.get(item.get("mark"))
+                mark = span_by_name.get(item.get("mark"))
                 part = str(item["part"])
                 start, end, text = int(item["start"]), int(item["end"]), str(item["text"])
                 if key and mark and (part == "name" or re.fullmatch(r"c\d+", part)) \
@@ -2402,7 +2440,7 @@ class MainWindow(QMainWindow):
                                "mark": MARK_NAMES[m]} for key, m in entries],
                     "words": [{"path": [[name, nth] for name, nth in key], "part": sp[0],
                                "start": sp[1], "end": sp[2], "text": sp[4],
-                               "mark": MARK_NAMES[sp[3]]} for key, sp in spans]}
+                               "mark": SPAN_MARK_NAMES[sp[3]]} for key, sp in spans]}
             f = QSaveFile(mp)
             if not f.open(QIODevice.OpenModeFlag.WriteOnly):
                 raise OSError(f.errorString())
@@ -2488,9 +2526,9 @@ class MainWindow(QMainWindow):
             ("Insert empty line (vertical lines kept)", "Alt+Enter"),
             ("Colour marks (names only)", ""),
             ("Checked (green) / To explore (orange)", "Alt+G / Alt+O"),
-            ("Problem (red) / Remove mark", "Alt+R / Alt+C  (same key again also removes)"),
+            ("Problem (red) / Default colour", "Alt+R / Alt+C  (same key again also removes)"),
             ("Colour the word at the cursor or the selection",
-             "Alt+Shift+G / O / R,  remove: Alt+Shift+C"),
+             "Alt+Shift+G / O / R,  default colour: Alt+Shift+C"),
             ("Move right / left one level", "Tab / Shift+Tab  (or Alt+Shift+→ / ←)"),
             ("Move up / down", "Alt+Shift+↑ / ↓"),
             ("Edit name & explanation", f"{EDIT_SHORTCUT}  (explanation only: Ctrl+E)"),

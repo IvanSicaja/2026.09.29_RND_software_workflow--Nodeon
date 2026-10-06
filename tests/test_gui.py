@@ -385,8 +385,8 @@ class GuiTests(unittest.TestCase):
         labels = {b._label: b for b in self.win.findChildren(app_module.ActionButton)}
         self.assertIn("Mark line", labels)
         self.assertIn("Mark words", labels)
-        self.assertEqual(labels["Mark line"]._keys(), "Alt+G/O/R")
-        self.assertEqual(labels["Mark words"]._keys(), "Alt+Shift+G/O/R")
+        self.assertEqual(labels["Mark line"]._keys(), "Alt+G/O/R/C")
+        self.assertEqual(labels["Mark words"]._keys(), "Alt+Shift+G/O/R/C")
         self.assertEqual(labels["Mark line"].menu().actions(), self.win.mark_actions)
         self.assertEqual(labels["Mark words"].menu().actions(), self.win.word_actions)
         self.assertEqual([app_module.shortcut_text(a) for a in self.win.word_actions],
@@ -553,6 +553,125 @@ class GuiTests(unittest.TestCase):
         with open(self.path + ".marks.json", encoding="utf-8") as f:
             data = __import__("json").load(f)
         self.assertEqual([w["text"] for w in data["words"]], ["Documentation"])
+
+    # default colour ----------------------------------------------------------
+    def test_default_colour_in_both_menus(self):
+        self.assertIn("Default colour", self.win.a_mark_clear.text())
+        self.assertIn("Default colour", self.win.a_word_clear.text())
+        self.assertIn(self.win.a_mark_clear, self.win.mark_menu.actions())
+        self.assertIn(self.win.a_word_clear, self.win.words_menu.actions())
+        self.assertNotIn(self.win.a_word_clear, self.win.mark_menu.actions())
+        self.assertNotIn(self.win.a_mark_clear, self.win.words_menu.actions())
+        self.assertEqual(app_module.shortcut_text(self.win.a_mark_clear), "Alt+C")
+        self.assertEqual(app_module.shortcut_text(self.win.a_word_clear), "Alt+Shift+C")
+
+    def test_line_default_colour(self):
+        for key in (K.Key_G, K.Key_O, K.Key_R):
+            self.mark(7, key)
+            self.key(K.Key_C, M.AltModifier)
+            self.assertEqual(set(self.colors_of(7, "README.md")), {self.c("file")})
+            self.mark(2, key)
+            self.key(K.Key_C, M.AltModifier)
+            self.assertEqual(set(self.colors_of(2, "src/")), {self.c("folder")})
+        self.assertEqual(self.ed.export_marks(), [])
+        self.assertIn("default colour", self.win.statusBar().currentMessage())
+
+    def test_word_default_colour_for_all_colours(self):
+        for key in (K.Key_G, K.Key_O, K.Key_R):
+            self.cursor_at(2, "Source", 2)
+            self.key(key, M.AltModifier | M.ShiftModifier)
+            self.key(K.Key_C, M.AltModifier | M.ShiftModifier)
+            self.assertEqual(set(self.colors_of(2, "Source")), {self.c("comment")})
+        self.assertEqual(self.ed.export_spans(), [])
+
+    def test_word_default_inside_line_coloured_name(self):
+        self.mark(4, K.Key_R)                                  # whole name red
+        self.select(4, "really")
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)     # just "really" default
+        self.assertEqual(set(self.colors_of(4, "really")), {self.c("file")})
+        self.assertEqual(set(self.colors_of(4, "a_")), {self.c("mark_problem")})
+        self.assertEqual(set(self.colors_of(4, "_long_module_name.py")), {self.c("mark_problem")})
+        # in a folder name the default keeps the folder colour (bold blue)
+        self.mark(2, K.Key_G)
+        self.cursor_at(2, "src/", 1)
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.c("folder")})
+
+    def test_word_default_saved_and_reloaded(self):
+        self.mark(4, K.Key_R)
+        self.select(4, "really")
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)
+        with open(self.path + ".marks.json", encoding="utf-8") as f:
+            data = __import__("json").load(f)
+        self.assertEqual([(w["text"], w["mark"]) for w in data["words"]], [("really", "default")])
+        self.win.close()
+        win2 = app_module.MainWindow(self.path)
+        old = self.ed
+        try:
+            self.ed = win2.editor
+            self.assertEqual(set(self.colors_of(4, "really")), {self.c("file")})
+            self.assertEqual(set(self.colors_of(4, "a_")), {self.c("mark_problem")})
+        finally:
+            self.ed = old
+            win2.editor.document().setModified(False)
+            win2.close()
+
+    def test_line_command_overrides_word_defaults(self):
+        self.mark(4, K.Key_R)
+        self.select(4, "really")
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)
+        self.mark(4, K.Key_G)                                  # whole name green again
+        self.assertEqual(set(self.colors_of(4, "a_really_long_module_name.py")),
+                         {self.c("mark_checked")})
+        self.assertEqual(self.ed.export_spans(), [])
+        self.select(4, "really")                               # and back via Alt+C
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)
+        self.mark(4, K.Key_C)
+        self.assertEqual(set(self.colors_of(4, "a_really_long_module_name.py")), {self.c("file")})
+        self.assertEqual(self.ed.export_spans(), [])
+        self.assertEqual(self.ed.export_marks(), [])
+
+    def test_word_default_when_already_default(self):
+        self.cursor_at(2, "Source", 2)
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)
+        self.assertIn("already in the default colour", self.win.statusBar().currentMessage())
+        self.assertFalse(os.path.exists(self.path + ".marks.json"))
+        self.mark(4, K.Key_R)
+        self.select(4, "really")
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)
+        self.select(4, "really")
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)    # second time: nothing to do
+        self.assertIn("already in the default colour", self.win.statusBar().currentMessage())
+        self.assertEqual(len(self.ed.export_spans()), 1)
+
+    def test_word_colour_over_word_default_and_mixed_selection(self):
+        self.mark(4, K.Key_R)
+        self.select(4, "really")
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)
+        self.select(4, "really")
+        self.key(K.Key_O, M.AltModifier | M.ShiftModifier)     # colour it again
+        self.assertEqual(set(self.colors_of(4, "really")), {self.c("mark_explore")})
+        # one selection over a coloured comment word and plain text
+        self.select(2, "Source")
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)
+        self.select(2, "src/", "code")                          # name + whole comment
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(2, "Source code")), {self.c("comment")})
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.c("folder")})
+
+    def test_word_default_follows_moves_and_undo(self):
+        self.mark(4, K.Key_R)
+        self.select(4, "really")
+        self.key(K.Key_C, M.AltModifier | M.ShiftModifier)
+        self.goto(4)
+        self.key(K.Key_Up, M.AltModifier | M.ShiftModifier)    # move branch up
+        line = [i for i, l in enumerate(self.lines()) if "a_really" in l][0]
+        self.assertEqual(set(self.colors_of(line, "really")), {self.c("file")})
+        self.assertEqual(set(self.colors_of(line, "a_")), {self.c("mark_problem")})
+        self.key(K.Key_Z, M.ControlModifier)
+        QTest.qWait(300)
+        self.assertEqual(set(self.colors_of(4, "really")), {self.c("file")})
+        self.assertEqual(set(self.colors_of(4, "a_")), {self.c("mark_problem")})
 
     def test_selection_still_wins_over_word(self):
         self.select(2, "urce co")                               # crosses two words
