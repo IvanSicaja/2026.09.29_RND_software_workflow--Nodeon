@@ -48,7 +48,8 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBo
 REQUIRED_MODEL_NAMES = ("FormatOptions", "Node", "TreeDocument", "TreeError", "parse",
                         "render", "format_text", "shift_comments", "insert_spacer",
                         "node_after_subtree", "node_keys", "line_segments", "add_span",
-                        "subtract_range", "is_covered", "resolve_span", "word_at")
+                        "subtract_range", "is_covered", "resolve_span", "word_at",
+                        "delete_row", "marker_at", "MARKER")
 
 
 class ModelLoadError(Exception):
@@ -250,7 +251,7 @@ def apply_app_palette(app: QApplication, dark: bool) -> None:
 # --------------------------------------------------------------------------- #
 class TreeHighlighter(QSyntaxHighlighter):
     _CONN = re.compile(r"├──|└──|\|--|`--|\+--")
-    _HASH = re.compile(r"\s#")
+    _HASH = re.compile(r"\s(?:\u27a1\ufe0f?|#)")       # explanation marker ➡️ (or old #)
 
     def __init__(self, document, theme: Theme) -> None:
         super().__init__(document)
@@ -291,10 +292,9 @@ class TreeHighlighter(QSyntaxHighlighter):
             self.setFormat(0, i, self.f_guide)
         rest = text[i:]
         stripped = rest.lstrip()
-        if stripped.startswith("#"):
+        if stripped[:1] in ("#", "\u27a1"):
             self.setFormat(i + len(rest) - len(stripped), n, self.f_comment)
-            self._paint_spans(n)
-            return
+            return                                   # explanations: always their own colour
         hm = self._HASH.search(rest)
         c = i + hm.start() + 1 if hm else n
         name = text[i:c].strip()
@@ -307,9 +307,9 @@ class TreeHighlighter(QSyntaxHighlighter):
             else:
                 fmt = self.f_folder if folder else self.f_file
             self.setFormat(start, len(name), fmt)
+        self._paint_spans(n)                          # coloured words (names only)
         if hm:
-            self.setFormat(c, n - c, self.f_comment)
-        self._paint_spans(n)
+            self.setFormat(c, n - c, self.f_comment)   # explanation colour always wins
 
     def _paint_spans(self, n: int) -> None:
         for start, end, mark, bold in self.span_provider(self.currentBlock().blockNumber()):
@@ -858,7 +858,7 @@ class TreeEditor(QPlainTextEdit):
         self.marks = {key: m for key, m in entries if m in MARK_NAMES}
         self.spans = {}
         for key, sp in spans or []:
-            if sp[3] in SPAN_MARK_NAMES and sp[2] > sp[1]:
+            if sp[3] in SPAN_MARK_NAMES and sp[2] > sp[1] and sp[0] == "name":
                 self.spans.setdefault(key, []).append(sp)
         self._sync_marks()
         self._resolve_spans()
@@ -925,6 +925,8 @@ class TreeEditor(QPlainTextEdit):
                 key = keys[id(node)]
                 text = self._block(line).text()
                 for _n, seg, s, e, bold in self._line_segments(line, text, numbers):
+                    if seg != "name":
+                        continue                     # explanations are never coloured
                     seg_text = text[s:e]
                     resolved = []
                     for sp in self.spans[key]:
@@ -951,16 +953,17 @@ class TreeEditor(QPlainTextEdit):
                 self.highlighter.rehighlightBlock(self._block(line))
 
     def mark_words(self, mark: int) -> None:
-        """Colour only the selected characters (names and explanations; the
-        tree lines are never coloured). Same colour again removes it."""
+        """Colour only the selected characters / the word at the cursor in
+        branch names. Explanations and tree lines are never coloured. Same
+        colour again removes it."""
         self.ensure_parsed()
         cur = self.textCursor()
         doc = self.document()
         if not cur.hasSelection():
             word = self._word_at_cursor()
             if word is None:
-                self.statusMessage.emit("No word at the cursor - put the cursor on a word "
-                                        "or select text")
+                self.statusMessage.emit("No word at the cursor - put the cursor on a word of a "
+                                        "name (explanations always keep their own colour)")
                 return
             a, b = word
         else:
@@ -975,11 +978,14 @@ class TreeEditor(QPlainTextEdit):
             la = u16_to_cp(text, max(a, block.position()) - block.position())
             lb = u16_to_cp(text, min(b, block.position() + u16len(text)) - block.position())
             for node, seg, s, e, _bold in self._line_segments(line, text, numbers):
+                if seg != "name":
+                    continue                         # explanations keep their colour
                 x, y = max(s, la), min(e, lb)
                 if x < y:
                     pieces.append((keys[id(node)], seg, x - s, y - s, text[s:e], node))
         if not pieces:
-            self.statusMessage.emit("The selection contains no name or explanation text")
+            self.statusMessage.emit("Nothing to colour here - explanations always keep their "
+                                    "own colour; colour names instead")
             return
         if mark and all(tm.is_covered(self.spans.get(k, []), seg, x, y, mark)
                         for k, seg, x, y, _t, _n in pieces):
@@ -1018,15 +1024,15 @@ class TreeEditor(QPlainTextEdit):
         self.marksChanged.emit()
 
     def _word_at_cursor(self) -> Optional[Tuple[int, int]]:
-        """Document positions (start, end) of the word at the cursor, inside a
-        name or explanation only; None on spaces, tree lines or '#'."""
+        """Document positions (start, end) of the word at the cursor inside a
+        branch name; None on spaces, tree lines and explanations."""
         cur = self.textCursor()
         block = cur.block()
         line = block.blockNumber()
         text = block.text()
         col = u16_to_cp(text, cur.positionInBlock())
-        for _node, _seg, s, e, _bold in self._line_segments(line, text, self._comment_numbers()):
-            if s <= col <= e:
+        for _node, seg, s, e, _bold in self._line_segments(line, text, self._comment_numbers()):
+            if seg == "name" and s <= col <= e:
                 w = tm.word_at(text[s:e], col - s)
                 if w is not None:
                     pos = block.position()
@@ -1037,6 +1043,51 @@ class TreeEditor(QPlainTextEdit):
         self.ensure_parsed()
         self._resolve_spans()
         return [(key, sp) for key, lst in self._visible_spans.items() for sp in lst]
+
+    def delete_line(self) -> None:
+        """Ctrl+Q: delete only the row at the cursor (a branch row keeps its
+        sub-items: they move up one level into its place)."""
+        self.ensure_parsed()
+        line = self.textCursor().blockNumber()
+        if not 0 <= line < len(self._map):
+            self.statusMessage.emit("Nothing to delete here")
+            return
+        kind = self._map.kinds[line]
+        node = self._map.nodes[line]
+        comment_index = self._comment_numbers().get(line, 0)
+        preamble_index = sum(1 for k in self._map.kinds[:line] if k == tm.KIND_PREAMBLE)
+        if kind == tm.KIND_NODE and node is not None and node.parent is None:
+            self.statusMessage.emit("Nothing to delete here")
+            return
+        what = {tm.KIND_NODE: "Line deleted (sub-items kept)",
+                tm.KIND_COMMENT: "Explanation line deleted",
+                tm.KIND_GAP: "Empty line deleted",
+                tm.KIND_PREAMBLE: "Line deleted"}.get(kind, "Line deleted")
+        if kind == tm.KIND_NODE and node is not None and not node.children:
+            what = "Line deleted"
+
+        def op(_n):
+            tm.delete_row(self._model, kind, node, comment_index, preamble_index)
+            return None, "keep"
+
+        if not self.run_op(op, require_node=False):
+            return
+        doc = self.document()
+        target = min(line, doc.blockCount() - 1)
+        block = doc.findBlockByNumber(max(0, target))
+        while block.isValid() and not block.isVisible():
+            block = block.previous()
+        if not block.isValid():
+            block = doc.begin()
+        n = block.blockNumber()
+        col = 0
+        if self._map.kinds[n] == tm.KIND_NODE if n < len(self._map) else False:
+            col = min(self._map.name_col.get(id(self._map.nodes[n]), 0), len(block.text()))
+        cur = QTextCursor(block)
+        cur.setPosition(block.position() + u16len(block.text()[:col]))
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+        self.statusMessage.emit(f"{what} - Ctrl+Z to undo")
 
     def insert_spacer(self) -> None:
         """Alt+Enter: insert an empty line below the current line. The vertical
@@ -1558,6 +1609,12 @@ def _draw_icon(p: QPainter, kind: str) -> None:
         else:
             line((14, 12), (21, 12))
             line((18, 8.5), (21.5, 12), (18, 15.5))
+    elif kind == "delete_line":                         # one row crossed out
+        line((4, 4.5), (20, 4.5))
+        line((4, 19.5), (20, 19.5))
+        line((4, 12), (11, 12))
+        line((14.5, 8.5), (21.5, 15.5))
+        line((14.5, 15.5), (21.5, 8.5))
     elif kind == "format":                              # names + aligned explanations
         for y, x_end in ((6, 9), (12, 12), (18, 7)):
             line((4, y), (x_end, y))
@@ -1762,7 +1819,7 @@ class EditNodeDialog(QDialog):
         self.explanation = QPlainTextEdit("\n".join(node.comment))
         self.explanation.setFont(font)
         self.explanation.setPlaceholderText(
-            "What is this for? Each line becomes a '#' line in the file.")
+            "What is this for? Each line becomes a ➡️ line in the file.")
         self.explanation.setMinimumHeight(140)
         form.addRow("Name", self.name)
         form.addRow("Explanation", self.explanation)
@@ -1800,9 +1857,9 @@ class EditNodeDialog(QDialog):
 
     def accept(self) -> None:
         name, _ = self.values()
-        if name.startswith("#") or re.search(r"\s#", name):
+        if tm.marker_at(name) or re.search(r"\s(?:\u27a1|#)", name):
             QMessageBox.warning(self, "Invalid name",
-                                "A name can't start with '#' or contain ' #' - "
+                                "A name can't start with ➡️ or # or contain ' ➡️' / ' #' - "
                                 "that marks the start of the explanation.\n"
                                 "Put that text in the Explanation box instead.")
             return
@@ -1822,8 +1879,8 @@ class SettingsDialog(QDialog):
         self.gap.setValue(opts.comment_gap)
         self.on_save = QCheckBox("Tidy the tree lines every time it is saved (explanation columns are kept)")
         self.on_save.setChecked(format_on_save)
-        form.addRow("Explanation '#' column (minimum)", self.min_col)
-        form.addRow("Spaces between longest name and '#'", self.gap)
+        form.addRow("Explanation ➡️ column (minimum)", self.min_col)
+        form.addRow("Spaces between longest name and ➡️", self.gap)
         form.addRow(self.on_save)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                                    | QDialogButtonBox.StandardButton.Cancel)
@@ -2018,7 +2075,7 @@ class MainWindow(QMainWindow):
         self.a_open = A("&Open…", self.open_dialog, QKeySequence.StandardKey.Open)
         self.a_save = A("&Save", self.save, QKeySequence.StandardKey.Save)
         self.a_save_as = A("Save &As…", self.save_as, "Ctrl+Shift+S")
-        self.a_quit = A("E&xit", self.close, "Ctrl+Q")
+        self.a_quit = A("E&xit", self.close)          # Ctrl+Q is "Delete line"
 
         self.a_undo = A("&Undo", e.undo, QKeySequence.StandardKey.Undo)
         self.a_redo = A("&Redo", e.redo, [QKeySequence.StandardKey.Redo, "Ctrl+Y"])
@@ -2057,6 +2114,8 @@ class MainWindow(QMainWindow):
         self.a_duplicate = A("Duplicate branch", e.duplicate, "Ctrl+D")
         self.a_delete = A("Delete branch", e.delete_branch, "Ctrl+Shift+Delete",
                           "Delete the item and everything inside it")
+        self.a_delete_line = A("Delete line", e.delete_line, "Ctrl+Q",
+                               "Delete only this row - sub-items stay and move up one level")
         self.a_up = A("Move up", e.move_up, "Alt+Shift+Up")
         self.a_down = A("Move down", e.move_down, "Alt+Shift+Down")
         self.a_left = A("Move left (outdent)", e.outdent, "Alt+Shift+Left",
@@ -2066,10 +2125,10 @@ class MainWindow(QMainWindow):
         self.a_format = A("Format document", lambda: e.format_document(), "Ctrl+Alt+L",
                           "Re-draw all lines and align every explanation")
         self.a_expl_left = A("Move explanations left", lambda: e.shift_explanations(-1),
-                             "Alt+Left", "Move explanations (#) left - selected lines, or the "
+                             "Alt+Left", "Move explanations (➡️) left - selected lines, or the "
                              "whole document if nothing is selected")
         self.a_expl_right = A("Move explanations right", lambda: e.shift_explanations(1),
-                              "Alt+Right", "Move explanations (#) right - selected lines, or the "
+                              "Alt+Right", "Move explanations (➡️) right - selected lines, or the "
                               "whole document if nothing is selected")
         self.a_mark_checked = A("Mark as checked", lambda: e.mark_selection(MARK_CHECKED),
                                 "Alt+G", "Colour the name green: checked / OK "
@@ -2122,7 +2181,8 @@ class MainWindow(QMainWindow):
 
         e.reserve_shortcuts(self.actions())
         e.context_actions = [self.a_edit, self.a_explain, None, self.a_add_sibling,
-                             self.a_add_child, self.a_spacer, self.a_duplicate, self.a_delete, None,
+                             self.a_add_child, self.a_spacer, self.a_duplicate, self.a_delete_line,
+                             self.a_delete, None,
                              self.a_up, self.a_down, self.a_left, self.a_right, None,
                              self.a_toggle, self.a_collapse_branch, self.a_expand_branch, None,
                              *self.mark_actions, None, *self.word_actions]
@@ -2145,7 +2205,7 @@ class MainWindow(QMainWindow):
 
         m = mb.addMenu("&Tree")
         m.addActions([self.a_add_sibling, self.a_add_child, self.a_spacer, self.a_edit, self.a_explain,
-                      self.a_duplicate, self.a_delete])
+                      self.a_duplicate, self.a_delete_line, self.a_delete])
         m.addSeparator()
         m.addActions([self.a_up, self.a_down, self.a_left, self.a_right])
         m.addSeparator()
@@ -2217,7 +2277,8 @@ class MainWindow(QMainWindow):
             (self.a_edit, "Explanation"), None,
             (self.a_up, "Move up"), (self.a_down, "Move down"),
             (self.a_left, "Move left"), (self.a_right, "Move right"), None,
-            (self.a_format, "Format"), (self.a_delete, "Delete"),
+            (self.a_format, "Format"), (self.a_delete_line, "Delete line"),
+            (self.a_delete, "Delete branch"),
         ])
 
     def _add_tool_buttons(self, tb: QToolBar, items) -> None:
@@ -2240,8 +2301,9 @@ class MainWindow(QMainWindow):
                 (self.a_edit, "edit"), (self.a_delete, "delete"),
                 (self.a_up, "up"), (self.a_down, "down"), (self.a_left, "left"),
                 (self.a_right, "right"), (self.a_format, "format"),
+                (self.a_delete_line, "delete_line"),
                 (self.a_expl_left, "expl_left"), (self.a_expl_right, "expl_right")):
-            action.setIcon(make_icon(kind, danger if kind == "delete" else color))
+            action.setIcon(make_icon(kind, danger if kind in ("delete", "delete_line") else color))
         theme = self.editor.theme
         self.a_mark_checked.setIcon(make_dots_icon([theme.mark_checked]))
         self.a_mark_explore.setIcon(make_dots_icon([theme.mark_explore]))
@@ -2417,7 +2479,9 @@ class MainWindow(QMainWindow):
                 mark = span_by_name.get(item.get("mark"))
                 part = str(item["part"])
                 start, end, text = int(item["start"]), int(item["end"]), str(item["text"])
-                if key and mark and (part == "name" or re.fullmatch(r"c\d+", part)) \
+                # Only names can be coloured (older files may hold explanation
+                # colours - those are ignored).
+                if key and mark and part == "name" \
                         and 0 <= start < end and len(text) == end - start:
                     spans.append((key, (part, start, end, mark, text)))
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as ex:
@@ -2533,6 +2597,7 @@ class MainWindow(QMainWindow):
             ("Move up / down", "Alt+Shift+↑ / ↓"),
             ("Edit name & explanation", f"{EDIT_SHORTCUT}  (explanation only: Ctrl+E)"),
             ("Duplicate / delete branch", "Ctrl+D / Ctrl+Shift+Delete"),
+            ("Delete line (sub-items kept)", "Ctrl+Q"),
             ("Remove an empty new item", "Backspace"),
             ("Move explanations left / right", "Alt+← / Alt+→  (selection, or whole document)"),
             ("Format document (auto-align all)", "Ctrl+Alt+L  (saving tidies lines, keeps # columns)"),

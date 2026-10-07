@@ -44,7 +44,18 @@ KIND_PREAMBLE = "preamble"
 
 _GUIDES = "│| "
 _CONNECTOR_RE = re.compile(r"├──|└──|\|--|`--|\+--")
-_COMMENT_SPLIT_RE = re.compile(r"\s#")
+# Explanations start with the arrow "➡️" (U+27A1 + U+FE0F). Files written with
+# "#" (older versions) or a plain "➡" are still read; saving writes "➡️".
+MARKER = "\u27a1\ufe0f"
+_MARKER_PAT = "(?:\u27a1\ufe0f?|#)"
+_MARKER_START_RE = re.compile(_MARKER_PAT)
+_COMMENT_SPLIT_RE = re.compile(r"\s" + _MARKER_PAT)
+
+
+def marker_at(text: str, pos: int = 0) -> int:
+    """Length of the explanation marker starting at text[pos] (0 if none)."""
+    m = _MARKER_START_RE.match(text, pos)
+    return m.end() - pos if m else 0
 
 
 class TreeError(Exception):
@@ -240,10 +251,10 @@ def _lead(line: str) -> int:
 
 
 def _hash_index(content: str) -> int:
-    """Index of the "#" that starts the explanation in content (-1 if none)."""
+    """Index of the marker ("➡️" or "#") that starts the explanation (-1 if none)."""
     stripped = content.lstrip()
     offset = len(content) - len(stripped)
-    if stripped.startswith("#"):
+    if marker_at(stripped):
         return offset
     m = _COMMENT_SPLIT_RE.search(stripped)
     return offset + m.start() + 1 if m else -1
@@ -251,8 +262,9 @@ def _hash_index(content: str) -> int:
 
 def _split_name(content: str) -> Tuple[str, List[str]]:
     content = content.strip()
-    if content.startswith("#"):
-        return "", [content[1:].strip()]
+    k = marker_at(content)
+    if k:
+        return "", [content[k:].strip()]
     m = _COMMENT_SPLIT_RE.search(content)
     if m:
         return content[:m.start()].rstrip(), [content[m.end():].strip()]
@@ -286,12 +298,13 @@ def parse(text: str) -> Tuple[TreeDocument, LineMap]:
             ncol = m.end() + (len(content) - len(content.lstrip(" ")))
         else:
             rest = line[lead:]
-            if rest.startswith("#"):
+            k = marker_at(rest)
+            if k:
                 if last is not None:
                     for j in pending:
                         nodes[j] = last
                     pending = []
-                    last.comment.append(rest[1:].strip())
+                    last.comment.append(rest[k:].strip())
                     kinds[i], nodes[i] = KIND_COMMENT, last
                 else:
                     doc.preamble.append(line.strip())
@@ -325,7 +338,7 @@ def parse(text: str) -> Tuple[TreeDocument, LineMap]:
 # --------------------------------------------------------------------------- #
 def _with_comment(first: str, col: int, text: str) -> str:
     pad = max(1, col - len(first))
-    return first + " " * pad + ("# " + text if text else "#")
+    return first + " " * pad + (MARKER + " " + text if text else MARKER)
 
 
 def first_line_length(node: Node) -> int:
@@ -640,7 +653,7 @@ def line_segments(text: str) -> List[Tuple[str, int, int]]:
     out: List[Tuple[str, int, int]] = []
     rest = text[i:]
     stripped = rest.lstrip()
-    if stripped.startswith("#"):
+    if marker_at(stripped):
         hash_pos = i + len(rest) - len(stripped)
     else:
         hm = _COMMENT_SPLIT_RE.search(rest)
@@ -655,7 +668,7 @@ def line_segments(text: str) -> List[Tuple[str, int, int]]:
         if ne > ns:
             out.append(("name", ns, ne))
     if hash_pos >= 0:
-        cs = hash_pos + 1
+        cs = hash_pos + max(1, marker_at(text, hash_pos))
         while cs < n and text[cs] in " \t":
             cs += 1
         ce = n
@@ -760,3 +773,47 @@ def word_at(text: str, pos: int) -> Optional[Tuple[int, int]]:
         if s > pos:
             break
     return left or right
+
+
+
+def delete_row(doc: TreeDocument, kind: str, node: Optional[Node],
+               comment_index: int = 0, preamble_index: int = 0) -> None:
+    """Delete exactly one row of the text.
+
+    * branch row: the branch is removed; its sub-items stay and move up one
+      level into its place (nothing below it is lost). Its explanation goes
+      with it (it has nothing left to explain).
+    * explanation row (2nd, 3rd ... line): only that explanation line.
+    * empty spacer row: one spacer line.
+    * text row above the tree: that row.
+    """
+    if kind == KIND_NODE and node is not None:
+        parent = _require_parent(node)
+        idx = node.index
+        kids = list(node.children)
+        node.detach()
+        for offset, kid in enumerate(kids):
+            parent.insert_child(idx + offset, kid)
+        follower = parent.children[idx] if idx < len(parent.children) else None
+        if follower is not None:
+            follower.gap_before = max(follower.gap_before, node.gap_before)
+        node.children = []
+    elif kind == KIND_COMMENT and node is not None:
+        if not 1 <= comment_index < len(node.comment):
+            raise TreeError("This explanation line no longer exists")
+        del node.comment[comment_index]
+    elif kind == KIND_GAP:
+        if node is not None:
+            if node.gap_before <= 0:
+                raise TreeError("Nothing to delete here")
+            node.gap_before -= 1
+        else:
+            if doc.trailing_blank <= 0:
+                raise TreeError("Nothing to delete here")
+            doc.trailing_blank -= 1
+    elif kind == KIND_PREAMBLE:
+        if not 0 <= preamble_index < len(doc.preamble):
+            raise TreeError("Nothing to delete here")
+        del doc.preamble[preamble_index]
+    else:
+        raise TreeError("Nothing to delete here")

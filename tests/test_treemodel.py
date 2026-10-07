@@ -14,6 +14,8 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "main"))
 
 import treemodel as tm  # noqa: E402
 
+MK = "\u27a1\ufe0f"                       # explanation marker ➡️
+
 # The example tree may live in main/ or data/ - use whichever exists.
 EXAMPLE_CANDIDATES = [
     os.path.join(PROJECT_ROOT, "data", "example_project_tree.txt"),
@@ -40,9 +42,9 @@ class ParseRender(unittest.TestCase):
         text, _ = tm.render(doc)
         self.assertEqual(text.split("\n"), [
             "r/",
-            "├── a/                            # A",
+            "├── a/                            " + MK + " A",
             "│   └── b",
-            "└── c                             # C",
+            "└── c                             " + MK + " C",
             "",
         ])
 
@@ -105,7 +107,7 @@ class ExplanationColumns(unittest.TestCase):
 
     def cols(self):
         text = tm.render(self.doc, preserve_columns=True)[0]
-        return [line.index("#") for line in text.split("\n")[1:]]
+        return [line.index(MK) for line in text.split("\n")[1:]]
 
     def test_parse_records_column(self):
         self.assertEqual([n.comment_col for n in self.nodes], [34, 34, 34])
@@ -117,7 +119,7 @@ class ExplanationColumns(unittest.TestCase):
         tm.shift_comments(self.nodes, -1, 3)      # long name blocks at 28 (3 spaces)
         self.assertEqual(self.cols(), [27, 28, 27])
         text = tm.render(self.doc, preserve_columns=True)[0].split("\n")
-        self.assertTrue(text[2].startswith("├── a_very_long_name_here   #"))
+        self.assertTrue(text[2].startswith("├── a_very_long_name_here   " + MK))
         while True:
             try:
                 tm.shift_comments(self.nodes, -1, 3)
@@ -158,8 +160,8 @@ class ExplanationColumns(unittest.TestCase):
         a = doc.root.children[0].children[0]
         tm.shift_comments([a], 1, 3)
         lines = tm.render(doc, preserve_columns=True)[0].split("\n")
-        self.assertEqual(lines[1].index("#"), lines[2].index("#"))
-        self.assertEqual(lines[1].index("#"), 27)
+        self.assertEqual(lines[1].index(MK), lines[2].index(MK))
+        self.assertEqual(lines[1].index(MK), 27)
 
     def test_no_explanations(self):
         doc, _ = tm.parse("r/\n└── a")
@@ -183,7 +185,7 @@ class ExplanationColumns(unittest.TestCase):
     def test_canonical_format_unchanged(self):
         for _ in range(4):
             tm.shift_comments(self.nodes, 1, 3)
-        self.assertEqual(tm.render(self.doc)[0], self.SRC)
+        self.assertEqual(tm.render(self.doc)[0], self.SRC.replace("#", MK))
 
 
 
@@ -307,6 +309,86 @@ class WordAtCursor(unittest.TestCase):
         self.assertIsNone(self.w(0, ""))
         self.assertIsNone(self.w(1, "( )"))
         self.assertIsNone(self.w(99, "abc"))
+
+
+
+class ArrowMarker(unittest.TestCase):
+    def test_reads_arrow_plain_arrow_and_hash(self):
+        for marker in (MK, "\u27a1", "#"):
+            src = f"r/\n├── a/     {marker} one\n│          {marker} two\n└── b"
+            doc, _ = tm.parse(src)
+            a = doc.root.children[0].children[0]
+            self.assertEqual((a.name, a.comment), ("a/", ["one", "two"]))
+            self.assertEqual(a.comment_col, 11)
+
+    def test_writes_arrow(self):
+        out = tm.format_text("r/\n└── a  # x\n           # y")
+        self.assertEqual(out.split("\n")[1:], ["└── a                             " + MK + " x",
+                                              "                                  " + MK + " y"])
+        self.assertNotIn("#", out)
+        self.assertEqual(tm.format_text(out), out)                  # stable
+
+    def test_explanation_alone_and_empty(self):
+        doc, _ = tm.parse("r/\n└── " + MK + " only text")
+        n = doc.root.children[0].children[0]
+        self.assertEqual((n.name, n.comment), ("", ["only text"]))
+        doc.root.children[0].children[0].comment = [""]
+        self.assertTrue(tm.render(doc)[0].endswith(MK))
+
+    def test_name_with_hash_inside_is_kept(self):
+        doc, _ = tm.parse("r/\n└── C#-notes   " + MK + " x")
+        n = doc.root.children[0].children[0]
+        self.assertEqual((n.name, n.comment), ("C#-notes", ["x"]))
+
+    def test_line_segments_with_arrow(self):
+        t = "│   ├── 01_media/   " + MK + " Organized media"
+        self.assertEqual({k: t[s:e] for k, s, e in tm.line_segments(t)},
+                         {"name": "01_media/", "comment": "Organized media"})
+        t = "│                   " + MK + " more text"
+        self.assertEqual([t[s:e] for _, s, e in tm.line_segments(t)], ["more text"])
+
+
+class DeleteRow(unittest.TestCase):
+    SRC = "r/\n│\n├── a/   # x\n│        # y\n│   ├── a1\n│   └── a2\n├── b\n└── c"
+
+    def setUp(self):
+        self.doc, self.lm = tm.parse(self.SRC)
+        self.r = self.doc.root.children[0]
+        self.a, self.b, self.c = self.r.children
+
+    def names(self):
+        return [n.name for n in self.doc.iter_nodes()]
+
+    def test_branch_row_keeps_sub_items(self):
+        tm.delete_row(self.doc, tm.KIND_NODE, self.a)
+        self.assertEqual(self.names(), ["r/", "a1", "a2", "b", "c"])
+        self.assertEqual([n.parent for n in self.r.children], [self.r] * 4)
+        self.assertEqual(self.r.children[0].gap_before, 1)          # spacer stays above
+
+    def test_leaf_row(self):
+        tm.delete_row(self.doc, tm.KIND_NODE, self.b)
+        self.assertEqual(self.names(), ["r/", "a/", "a1", "a2", "c"])
+
+    def test_explanation_row(self):
+        tm.delete_row(self.doc, tm.KIND_COMMENT, self.a, comment_index=1)
+        self.assertEqual(self.a.comment, ["x"])
+        with self.assertRaises(tm.TreeError):
+            tm.delete_row(self.doc, tm.KIND_COMMENT, self.a, comment_index=1)
+
+    def test_spacer_and_trailing_rows(self):
+        tm.delete_row(self.doc, tm.KIND_GAP, self.a)
+        self.assertEqual(self.a.gap_before, 0)
+        with self.assertRaises(tm.TreeError):
+            tm.delete_row(self.doc, tm.KIND_GAP, self.a)
+        self.doc.trailing_blank = 1
+        tm.delete_row(self.doc, tm.KIND_GAP, None)
+        self.assertEqual(self.doc.trailing_blank, 0)
+
+    def test_text_is_exactly_one_row_shorter(self):
+        before = tm.render(self.doc)[0].split("\n")
+        tm.delete_row(self.doc, tm.KIND_NODE, self.c)
+        after = tm.render(self.doc)[0].split("\n")
+        self.assertEqual(len(after), len(before) - 1)
 
 
 if __name__ == "__main__":
