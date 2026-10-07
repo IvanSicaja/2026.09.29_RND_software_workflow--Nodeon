@@ -251,7 +251,7 @@ def apply_app_palette(app: QApplication, dark: bool) -> None:
 # --------------------------------------------------------------------------- #
 class TreeHighlighter(QSyntaxHighlighter):
     _CONN = re.compile(r"├──|└──|\|--|`--|\+--")
-    _HASH = re.compile(r"\s(?:\u27a1\ufe0f?|#)")       # explanation marker ➡️ (or old #)
+    _HASH = re.compile(r"\s\u27a1\ufe0f?")              # explanation marker ➡️ only
 
     def __init__(self, document, theme: Theme) -> None:
         super().__init__(document)
@@ -292,7 +292,7 @@ class TreeHighlighter(QSyntaxHighlighter):
             self.setFormat(0, i, self.f_guide)
         rest = text[i:]
         stripped = rest.lstrip()
-        if stripped[:1] in ("#", "\u27a1"):
+        if stripped[:1] == "\u27a1":
             self.setFormat(i + len(rest) - len(stripped), n, self.f_comment)
             return                                   # explanations: always their own colour
         hm = self._HASH.search(rest)
@@ -1857,9 +1857,9 @@ class EditNodeDialog(QDialog):
 
     def accept(self) -> None:
         name, _ = self.values()
-        if tm.marker_at(name) or re.search(r"\s(?:\u27a1|#)", name):
+        if tm.marker_at(name) or re.search(r"\s\u27a1", name):
             QMessageBox.warning(self, "Invalid name",
-                                "A name can't start with ➡️ or # or contain ' ➡️' / ' #' - "
+                                "A name can't start with ➡️ or contain ' ➡️' - "
                                 "that marks the start of the explanation.\n"
                                 "Put that text in the Explanation box instead.")
             return

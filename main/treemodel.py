@@ -16,9 +16,10 @@ The file format (4 columns per level):
 * A line without a connector at column 0 is a top-level (root) node.
 * "├── " / "└── " lines are branches; depth = column / 4 + 1.
 * Lines containing only "│" / spaces are blank spacer lines ("gaps").
-* A line that contains only guides followed by "#" continues the
+* A line that contains only guides followed by "➡️" continues the
   explanation of the branch above it.
-* "name   # text" splits into the branch name and its explanation.
+* "name   ➡️ text" splits into the branch name and its explanation
+  ("#" is normal text).
 
 parse() is tolerant (accepts ASCII "|--", "`--", "+--", tabs, NBSP from
 the `tree` command, indented text without connectors, uneven spacing).
@@ -44,10 +45,11 @@ KIND_PREAMBLE = "preamble"
 
 _GUIDES = "│| "
 _CONNECTOR_RE = re.compile(r"├──|└──|\|--|`--|\+--")
-# Explanations start with the arrow "➡️" (U+27A1 + U+FE0F). Files written with
-# "#" (older versions) or a plain "➡" are still read; saving writes "➡️".
+# Explanations start with the arrow "➡️" (U+27A1 + U+FE0F) - the only marker.
+# The same arrow without the invisible emoji selector ("➡") is accepted too.
+# "#" is ordinary text like every other character.
 MARKER = "\u27a1\ufe0f"
-_MARKER_PAT = "(?:\u27a1\ufe0f?|#)"
+_MARKER_PAT = "\u27a1\ufe0f?"
 _MARKER_START_RE = re.compile(_MARKER_PAT)
 _COMMENT_SPLIT_RE = re.compile(r"\s" + _MARKER_PAT)
 
@@ -157,7 +159,7 @@ class Node:
 class TreeDocument:
     def __init__(self) -> None:
         self.root = Node("")          # invisible container, depth -1
-        self.preamble: List[str] = []  # "#" lines before the first node
+        self.preamble: List[str] = []  # "➡️" lines before the first node
         self.trailing_blank = 0
 
     def iter_nodes(self) -> Iterator[Node]:
@@ -171,8 +173,8 @@ class TreeDocument:
 
 @dataclass
 class FormatOptions:
-    min_comment_column: int = 34   # "#" never starts left of this column
-    comment_gap: int = 3           # min spaces between longest name and "#"
+    min_comment_column: int = 34   # "➡️" never starts left of this column
+    comment_gap: int = 3           # min spaces between longest name and "➡️"
 
 
 # --------------------------------------------------------------------------- #
@@ -251,7 +253,7 @@ def _lead(line: str) -> int:
 
 
 def _hash_index(content: str) -> int:
-    """Index of the marker ("➡️" or "#") that starts the explanation (-1 if none)."""
+    """Index of the "➡️" that starts the explanation (-1 if none)."""
     stripped = content.lstrip()
     offset = len(content) - len(stripped)
     if marker_at(stripped):
@@ -348,7 +350,7 @@ def first_line_length(node: Node) -> int:
 
 
 def comment_min_col(node: Node, gap: int) -> int:
-    """Leftmost allowed "#" column: `gap` spaces after the longest text on any
+    """Leftmost allowed "➡️" column: `gap` spaces after the longest text on any
     line of the node's explanation (the name line or the continuation guides)."""
     d = node.depth
     longest = first_line_length(node)
@@ -610,7 +612,7 @@ def shift_comments(nodes: List[Node], direction: int, gap: int) -> int:
     """
     units = [n for n in nodes if n.comment]
     if not units:
-        raise TreeError("No explanations (#) in the selection")
+        raise TreeError("No explanations (➡️) in the selection")
     mins = {id(n): comment_min_col(n, gap) for n in units}
     cur = {id(n): max(n.comment_col if n.comment_col is not None else 0, mins[id(n)])
            for n in units}

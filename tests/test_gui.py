@@ -811,17 +811,47 @@ class GuiTests(unittest.TestCase):
         self.assertFalse(self.win.a_delete_line.icon().isNull())
 
     # the ➡️ marker -------------------------------------------------------------
-    def test_saves_with_arrow_and_reads_old_hash_files(self):
+    def test_hash_is_normal_text_everywhere(self):
         with open(self.path, "w", encoding="utf-8") as f:
-            f.write(SAMPLE.replace(MK, "#") + "\n")              # file from an older version
+            f.write("project/\n├── src/   # not an explanation\n└── C# notes\n")
         self.win.load_file(self.path)
-        self.assertEqual(set(self.colors_of(2, "# Source code")), {self.c("comment")})
+        # "#" text is part of the name: name colour, never the explanation colour
+        self.assertEqual(set(self.colors_of(1, "src/   # not an explanation")), {self.c("file")})
+        self.assertEqual(set(self.colors_of(2, "C# notes")), {self.c("file")})
+        self.assertTrue(all(not n.comment for n in self.ed._model.iter_nodes()))
         self.assertTrue(self.win.save())
         with open(self.path, encoding="utf-8") as f:
             text = f.read()
-        expected = SAMPLE.replace(".py  " + MK, ".py   " + MK)    # 3-space minimum applied
-        self.assertEqual(text, expected + "\n")
-        self.assertNotIn(" # ", text)
+        self.assertEqual(text, "project/\n├── src/   # not an explanation\n└── C# notes\n")
+        self.assertNotIn(MK, text)                                # nothing converted
+        # "#" can be coloured like any other character of a name
+        self.select(1, "# not")
+        self.key(K.Key_R, self.W)
+        self.assertEqual(set(self.colors_of(1, "# not")), {self.c("mark_problem")})
+
+    def test_typing_hash_vs_arrow(self):
+        self.ed.set_document_text("root/\n└── a")
+        self.goto(1)
+        self.ed.moveCursor(QTextCursor.MoveOperation.EndOfBlock)
+        QTest.keyClicks(self.ed, "   # hash text")
+        QTest.qWait(300)
+        self.assertEqual(set(self.colors_of(1, "# hash text")), {self.c("file")})
+        # QTest can only simulate ASCII keys, so the arrow is inserted the way the
+        # emoji keyboard / paste does it.
+        self.ed.insertPlainText("   " + MK + " real explanation")
+        QTest.qWait(300)
+        self.assertEqual(set(self.colors_of(1, MK + " real explanation")), {self.c("comment")})
+        self.assertEqual(set(self.colors_of(1, "# hash text")), {self.c("file")})
+        node = self.ed._map.node_at(1)
+        self.assertEqual((node.name, node.comment), ("a   # hash text", ["real explanation"]))
+
+    def test_alignment_ignores_hash(self):
+        self.ed.set_document_text("r/\n├── a # x   " + MK + " one\n└── b       " + MK + " two")
+        self.goto(0)
+        self.key(K.Key_Right, M.AltModifier)
+        cols = [l.index(MK) for l in self.lines() if MK in l]
+        self.assertEqual(len(set(cols)), 1)                       # aligned on ➡️ only
+        self.assertIn("├── a # x", self.lines()[1])
 
     def test_new_explanation_written_with_arrow(self):
         self.ed.set_document_text("root/\n└── a")
