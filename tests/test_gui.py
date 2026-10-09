@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "main"))
 
 try:
     from PySide6.QtCore import QSettings, Qt
-    from PySide6.QtGui import QColor, QTextCursor
+    from PySide6.QtCore import QEvent, QPoint, QPointF
+    from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QTextCursor
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog
 except ImportError:                                     # pragma: no cover
@@ -864,6 +865,285 @@ class GuiTests(unittest.TestCase):
         self.ed.run_op(op, require_node=False)
         self.assertTrue(self.lines()[1].endswith(MK + " new one"))
         self.assertEqual(set(self.colors_of(1, MK + " new one")), {self.c("comment")})
+
+    # pasting several lines (PDF / Word) ------------------------------------------
+    PASTE_SRC = ("r/\n├── a/\n│   ├── a1\n│   └── a2\n├── empty\n└── z/\n    └── z1")
+
+    def paste(self, text):
+        QApplication.clipboard().setText(text)
+        self.key(K.Key_V, M.ControlModifier)
+        QTest.qWait(10)
+
+    def tree_names(self):
+        self.ed.ensure_parsed()
+        return [(n.depth, n.name) for n in self.ed._model.iter_nodes()]
+
+    def test_paste_lines_become_siblings_on_same_level(self):
+        self.ed.set_document_text(self.PASTE_SRC)
+        self.goto(4)
+        self.ed.moveCursor(QTextCursor.MoveOperation.EndOfBlock)
+        self.paste("One\r\nTwo\r\n\r\nThree\r\n")              # Word style, blank line
+        self.assertEqual(self.lines(), ["r/", "├── a/", "│   ├── a1", "│   └── a2",
+                                        "├── emptyOne", "├── Two", "├── Three",
+                                        "└── z/", "    └── z1"])
+        line, col = self.ed.textCursor().blockNumber(), self.ed.textCursor().positionInBlock()
+        self.assertEqual((line, col), (6, len("├── Three")))
+
+    def test_paste_into_empty_new_branch_inside_a_branch(self):
+        self.ed.set_document_text(self.PASTE_SRC)
+        self.goto(2)
+        self.ed.moveCursor(QTextCursor.MoveOperation.EndOfBlock)
+        self.key(K.Key_Return)                                     # new empty item after a1
+        self.paste("Line 1\nLine 2\nLine 3")
+        self.assertEqual(self.tree_names(), [
+            (0, "r/"), (1, "a/"), (2, "a1"), (2, "Line 1"), (2, "Line 2"), (2, "Line 3"),
+            (2, "a2"), (1, "empty"), (1, "z/"), (2, "z1")])
+        self.assertEqual(self.lines()[3:7], ["│   ├── Line 1", "│   ├── Line 2",
+                                             "│   ├── Line 3", "│   └── a2"])
+
+    def test_paste_in_middle_of_name_and_undo(self):
+        self.ed.set_document_text(self.PASTE_SRC)
+        self.cursor_at(4, "empty", 2)                              # em|pty
+        self.paste("X\nY")
+        self.assertEqual(self.tree_names()[4:7], [(1, "emX"), (1, "Ypty"), (1, "z/")])
+        self.assertEqual(self.ed.textCursor().positionInBlock(), len("├── Y"))
+        self.key(K.Key_Z, M.ControlModifier)
+        self.assertEqual(self.ed.toPlainText(), self.PASTE_SRC)
+
+    def test_paste_replaces_selection_one_undo_step(self):
+        self.ed.set_document_text(self.PASTE_SRC)
+        self.select(4, "empty")
+        self.paste("P\nQ")
+        self.assertEqual(self.tree_names()[4:6], [(1, "P"), (1, "Q")])
+        self.key(K.Key_Z, M.ControlModifier)
+        self.assertEqual(self.ed.toPlainText(), self.PASTE_SRC)
+
+    def test_paste_after_branch_with_children_keeps_its_children(self):
+        self.ed.set_document_text(self.PASTE_SRC)
+        self.cursor_at(1, "a/", 2)                                 # end of "a/"
+        self.paste("b\nc")
+        self.assertEqual(self.tree_names()[:6], [
+            (0, "r/"), (1, "a/b"), (2, "a1"), (2, "a2"), (1, "c"), (1, "empty")])
+
+    def test_paste_into_explanation_adds_explanation_lines(self):
+        self.cursor_at(2, "Source code", 11)                       # end of explanation
+        self.paste(" more\nsecond pasted\nthird pasted")
+        src = self.ed._map.node_at(2)
+        self.assertEqual(src.comment, ["Source code more", "second pasted", "third pasted"])
+        self.assertEqual(src.name, "src/")
+        cols = [l.index(MK) for l in self.lines()[2:5]]
+        self.assertEqual(len(set(cols)), 1)                        # aligned under each other
+        self.assertEqual(self.lines()[5].strip()[:12], "│   ├── main")  # tree below intact
+
+    def test_paste_on_empty_spacer_line(self):
+        self.goto(1)                                               # "│" above src/
+        self.paste("new1\nnew2")
+        self.assertEqual([n for _d, n in self.tree_names()][:4], ["project/", "new1", "new2", "src/"])
+        self.assertEqual(self.lines()[1:3], ["├── new1", "├── new2"])
+
+    def test_paste_single_line_and_copied_tree_unchanged(self):
+        self.ed.set_document_text(self.PASTE_SRC)
+        self.cursor_at(4, "empty", 5)
+        self.paste("solo\n")                                      # Word adds a line break
+        self.assertEqual(self.lines()[4], "├── emptysolo")
+        self.assertEqual(len(self.lines()), 7)
+        self.paste("plain")                                        # normal paste unchanged
+        self.assertEqual(self.lines()[4], "├── emptysoloplain")
+        self.ed.set_document_text("r/\n└── a")
+        self.ed.moveCursor(QTextCursor.MoveOperation.End)
+        self.paste("\n├── b\n└── c")                              # a piece of tree: as it is
+        self.assertEqual(self.ed.toPlainText(), "r/\n└── a\n├── b\n└── c")
+
+    def test_paste_lines_with_arrow_get_explanations_and_marks_kept(self):
+        self.ed.set_document_text(self.PASTE_SRC)
+        self.mark(6, K.Key_G)                                      # z1 green
+        self.mark(4, K.Key_R)                                      # empty red
+        self.cursor_at(4, "empty", 5)
+        self.paste("\nfoo   " + MK + " the foo")
+        self.ed.ensure_parsed()
+        node = [n for n in self.ed._model.iter_nodes() if n.name == "foo"][0]
+        self.assertEqual(self.lines()[4], "├── empty")                # nothing merged
+        self.assertEqual(node.comment, ["the foo"])
+        z1 = [i for i, l in enumerate(self.lines()) if "z1" in l][0]
+        self.assertEqual(set(self.colors_of(z1, "z1")), {self.c("mark_checked")})
+        self.assertEqual(set(self.colors_of(4, "empty")), {self.c("mark_problem")})
+
+    def test_paste_keeps_space_before_first_word(self):
+        self.ed.set_document_text(self.PASTE_SRC)
+        self.cursor_at(4, "empty", 5)
+        self.paste(" next word\nnew")
+        self.assertEqual(self.tree_names()[4:6], [(1, "empty next word"), (1, "new")])
+
+    def test_paste_only_blank_lines_does_nothing(self):
+        before = self.ed.toPlainText()
+        self.goto(2)
+        self.paste("\n\n  \n")
+        self.assertEqual(self.ed.toPlainText(), before)
+
+    # column selection -------------------------------------------------------------
+    COL_SRC = "r/\n├── alpha    " + MK + " one\n├── beta     " + MK + " two\n└── gamma    " + MK + " three"
+    S = M.ShiftModifier if M is not None else None
+
+    def col_setup(self, line=1, col=4):
+        self.ed.set_document_text(self.COL_SRC)
+        b = self.ed.document().findBlockByNumber(line)
+        cur = QTextCursor(b)
+        cur.setPosition(b.position() + col)
+        self.ed.setTextCursor(cur)
+        self.key(K.Key_Insert, M.AltModifier | M.ShiftModifier)    # column mode on
+
+    def test_column_toggle_shortcut_button_and_status(self):
+        self.col_setup()
+        self.assertTrue(self.ed.column_mode())
+        self.assertTrue(self.win.a_column.isChecked())
+        self.assertFalse(self.win.column_label.isHidden())
+        labels = {b._label: b for b in self.win.findChildren(app_module.ActionButton)}
+        self.assertIn("Column select", labels)
+        self.assertEqual(labels["Column select"]._keys(), "Alt+Shift+Ins")
+        self.key(K.Key_Insert, M.AltModifier | M.ShiftModifier)
+        self.assertFalse(self.ed.column_mode())
+        self.assertFalse(self.win.a_column.isChecked())
+        self.assertTrue(self.win.column_label.isHidden())
+        self.win.a_column.trigger()                                # via the button
+        self.assertTrue(self.ed.column_mode())
+
+    def test_column_select_and_type_on_all_rows(self):
+        self.col_setup()
+        self.key(K.Key_Down, self.S)
+        self.key(K.Key_Down, self.S)
+        self.assertEqual(self.ed.block_rect(), (1, 3, 4, 4))
+        QTest.keyClicks(self.ed, "x_")
+        self.assertEqual(self.lines()[1:4], ["├── x_alpha    " + MK + " one",
+                                             "├── x_beta     " + MK + " two",
+                                             "└── x_gamma    " + MK + " three"])
+        self.key(K.Key_Z, M.ControlModifier)                       # one undo per key
+        self.key(K.Key_Z, M.ControlModifier)
+        self.assertEqual(self.ed.toPlainText(), self.COL_SRC)
+
+    def test_column_replace_rectangle_and_backspace_delete(self):
+        self.col_setup()
+        self.key(K.Key_Down, self.S)
+        for _ in range(4):
+            self.key(K.Key_Right, self.S)                          # "alph" / "beta"
+        self.assertEqual(self.ed.block_rect(), (1, 2, 4, 8))
+        QTest.keyClicks(self.ed, "Z")
+        self.assertEqual(self.lines()[1][:9], "├── Za   ")
+        self.assertEqual(self.lines()[2][:9], "├── Z    ")
+        self.key(K.Key_Backspace)                                  # removes the Z on both
+        self.assertEqual(self.lines()[1][:8], "├── a   ")
+        self.key(K.Key_Delete)                                     # removes "a" / " "
+        self.assertEqual(self.lines()[1][:5], "├──  ")
+        self.assertEqual(self.lines()[3], "└── gamma    " + MK + " three")   # untouched
+
+    def test_column_tab_and_shift_tab(self):
+        self.col_setup(col=13)                                     # just before the arrows
+        self.key(K.Key_Down, self.S)
+        self.key(K.Key_Down, self.S)
+        self.key(K.Key_Tab)
+        self.assertEqual([l.index(MK) for l in self.lines()[1:4]], [17, 17, 17])
+        self.key(K.Key_Backtab, self.S)
+        self.key(K.Key_Backtab, self.S)
+        self.assertEqual([l.index(MK) for l in self.lines()[1:4]], [9, 9, 9])
+        self.assertEqual(self.lines()[2], "├── beta " + MK + " two")   # only spaces removed
+        self.assertTrue(self.lines()[1].startswith("├── alpha"))
+
+    def test_column_copy_cut_paste(self):
+        self.col_setup()
+        self.key(K.Key_Down, self.S)
+        self.key(K.Key_Down, self.S)
+        for _ in range(4):
+            self.key(K.Key_Right, self.S)
+        self.key(K.Key_C, M.ControlModifier)
+        self.assertEqual(QApplication.clipboard().text(), "alph\nbeta\ngamm")
+        self.key(K.Key_X, M.ControlModifier)
+        self.assertEqual([l[4:6] for l in self.lines()[1:4]], ["a ", "  ", "a "])
+        self.key(K.Key_V, M.ControlModifier)                       # paste back row by row
+        self.assertEqual(self.ed.toPlainText(), self.COL_SRC)
+        self.ed.set_document_text(self.COL_SRC)                    # one line on every row
+        self.col_setup()
+        self.key(K.Key_Down, self.S)
+        self.key(K.Key_Down, self.S)
+        QApplication.clipboard().setText("- ")
+        self.key(K.Key_V, M.ControlModifier)
+        self.assertTrue(all(l[4:6] == "- " for l in self.lines()[1:4]))
+
+    def test_column_virtual_space_beyond_line_end(self):
+        self.ed.set_document_text("r/\n├── a\n├── bbbbbbbb\n└── c")
+        self.goto(1)
+        self.ed.moveCursor(QTextCursor.MoveOperation.EndOfBlock)
+        self.key(K.Key_Insert, M.AltModifier | M.ShiftModifier)
+        for _ in range(6):
+            self.key(K.Key_Right, self.S)                          # past the end of "a"
+        self.key(K.Key_Right)                                      # collapse to the right edge
+        self.assertEqual(self.ed.block_rect(), (1, 1, 11, 11))
+        self.key(K.Key_Down, self.S)
+        self.key(K.Key_Down, self.S)
+        QTest.keyClicks(self.ed, "|")
+        self.assertEqual(self.lines()[1:4], ["├── a      |", "├── bbbbbbb|b", "└── c      |"])
+
+    def test_column_mouse_drag(self):
+        self.ed.set_document_text(self.COL_SRC)
+        self.key(K.Key_Insert, M.AltModifier | M.ShiftModifier)
+        vp = self.ed.viewport()
+
+        def pt(line, col):
+            b = self.ed.document().findBlockByNumber(line)
+            geo = self.ed.blockBoundingGeometry(b).translated(self.ed.contentOffset())
+            x = self.ed._col_x(b, geo, col) + 1
+            return QPoint(int(x), int(geo.center().y()))
+        QTest.mousePress(vp, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pt(1, 4))
+        QTest.mouseMove(vp, pt(3, 6))
+        ev = QMouseEvent(QEvent.Type.MouseMove, QPointF(pt(3, 6)), QPointF(vp.mapToGlobal(pt(3, 6))),
+                         Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(vp, ev)
+        QTest.mouseRelease(vp, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pt(3, 6))
+        self.assertEqual(self.ed.block_rect(), (1, 3, 4, 6))
+        self.key(K.Key_C, M.ControlModifier)
+        self.assertEqual(QApplication.clipboard().text(), "al\nbe\nga")
+
+    def test_column_selection_converted_from_normal_selection(self):
+        self.ed.set_document_text(self.COL_SRC)
+        self.select(1, "alpha", "be", end_line=2)
+        self.key(K.Key_Insert, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(self.ed.block_rect(), (1, 2, 4, 6))
+
+    def test_column_ends_on_other_edits_escape_and_folds(self):
+        self.col_setup()
+        self.key(K.Key_Down, self.S)
+        self.key(K.Key_Escape)
+        self.assertIsNone(self.ed.block_rect())
+        self.assertTrue(self.ed.column_mode())                     # mode stays on
+        self.key(K.Key_Down, self.S)                               # new block from cursor
+        self.assertIsNotNone(self.ed.block_rect())
+        self.key(K.Key_Q, M.ControlModifier)                       # structural edit
+        self.assertIsNone(self.ed.block_rect())
+        # folded lines are skipped
+        self.ed.set_document_text("r/\n├── a/\n│   └── hidden\n└── b")
+        self.ed.toggle_fold(1)
+        self.goto(1)
+        self.ed.set_column_mode(False)
+        self.ed.set_column_mode(True)
+        self.key(K.Key_Down, self.S)
+        QTest.keyClicks(self.ed, "#")
+        self.assertIn("hidden", self.ed.toPlainText().split("\n")[2])
+        self.assertTrue(self.lines()[2].endswith("hidden"))
+
+    def test_column_mode_off_normal_editing_unchanged(self):
+        self.col_setup()
+        self.key(K.Key_Insert, M.AltModifier | M.ShiftModifier)    # off again
+        self.key(K.Key_Down, self.S)
+        self.assertIsNone(self.ed.block_rect())
+        self.assertTrue(self.ed.textCursor().hasSelection())       # normal row selection
+
+    def test_column_altgr_characters(self):
+        self.col_setup()
+        self.key(K.Key_Down, self.S)
+        ev = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_2,
+                       M.ControlModifier | M.AltModifier, "@")      # AltGr+2 on Swiss keyboards
+        QApplication.sendEvent(self.ed, ev)
+        self.assertTrue(self.lines()[1].startswith("├── @alpha"))
+        self.assertTrue(self.lines()[2].startswith("├── @beta"))
 
     # existing behaviour still works ------------------------------------
     def test_folding_levels(self):

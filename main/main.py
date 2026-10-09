@@ -49,7 +49,8 @@ REQUIRED_MODEL_NAMES = ("FormatOptions", "Node", "TreeDocument", "TreeError", "p
                         "render", "format_text", "shift_comments", "insert_spacer",
                         "node_after_subtree", "node_keys", "line_segments", "add_span",
                         "subtract_range", "is_covered", "resolve_span", "word_at",
-                        "delete_row", "marker_at", "MARKER")
+                        "delete_row", "marker_at", "MARKER", "paste_lines",
+                        "looks_like_tree", "normalize_paste", "replace_columns")
 
 
 class ModelLoadError(Exception):
@@ -345,6 +346,7 @@ class TreeEditor(QPlainTextEdit):
     statusMessage = Signal(str)
     foldsChanged = Signal()
     marksChanged = Signal()
+    columnModeChanged = Signal(bool)
     openFileRequested = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -359,6 +361,15 @@ class TreeEditor(QPlainTextEdit):
         # Status marks by node key; the line states are the live copy, this
         # registry restores marks after Undo and is what gets saved.
         self.marks: Dict[tm.NodeKey, int] = {}
+        self._join_next_edit = False
+        self._in_drop = False
+        # Column (block) selection: [anchor line, anchor col, line, col] in
+        # characters; columns may lie beyond the end of a line (virtual space).
+        self._col_mode = False
+        self._blk: Optional[List[int]] = None
+        self._blk_rev = -1
+        self._blk_internal = False
+        self._blk_drag = False
         # Coloured words: node key -> spans (see treemodel.Span).
         self.spans: Dict[tm.NodeKey, List[tm.Span]] = {}
         self._visible_spans: Dict[tm.NodeKey, List[tm.Span]] = {}
@@ -382,6 +393,7 @@ class TreeEditor(QPlainTextEdit):
         self.updateRequest.connect(self._on_update_request)
         self.cursorPositionChanged.connect(self._on_cursor_moved)
         self.document().contentsChanged.connect(self._timer.start)
+        self.document().contentsChanged.connect(self._block_check_edit)
         self._update_gutter_width()
         self._highlight_current_line()
 
@@ -420,6 +432,7 @@ class TreeEditor(QPlainTextEdit):
 
     # ---- document ----------------------------------------------------------
     def set_document_text(self, text: str) -> None:
+        self._blk = None
         self.marks = {}
         self.spans = {}
         self._visible_spans = {}
@@ -635,7 +648,11 @@ class TreeEditor(QPlainTextEdit):
         s = len(os.path.commonprefix([old[::-1], new[::-1]]))
         s = min(s, max_s)
         cur = self.textCursor()        # editor cursor, so Undo returns here
-        cur.beginEditBlock()
+        if self._join_next_edit:
+            self._join_next_edit = False
+            cur.joinPreviousEditBlock()    # one Undo step with the edit before
+        else:
+            cur.beginEditBlock()
         cur.setPosition(u16len(old[:p]))
         cur.setPosition(u16len(old[:len(old) - s]), QTextCursor.MoveMode.KeepAnchor)
         cur.insertText(new[p:len(new) - s])
@@ -1234,6 +1251,8 @@ class TreeEditor(QPlainTextEdit):
 
     # ---- keyboard ---------------------------------------------------------
     def keyPressEvent(self, e) -> None:
+        if self._col_mode and self._column_key(e):
+            return
         key = e.key()
         mods = e.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
         plain = mods == Qt.KeyboardModifier.NoModifier
@@ -1338,6 +1357,9 @@ class TreeEditor(QPlainTextEdit):
                 self.setTextCursor(cur)
                 return
         self._last_block = b.blockNumber()
+        if self._blk is not None and not self._blk_internal:
+            self._blk = None                         # cursor moved elsewhere: block ends
+            self.viewport().update()
         self._highlight_current_line()
         self.gutter.update()
 
@@ -1453,6 +1475,8 @@ class TreeEditor(QPlainTextEdit):
 
     def paintEvent(self, e) -> None:
         super().paintEvent(e)
+        if self._blk is not None:
+            self._paint_block(e)
         if not self._ranges or not self._rev_ok():
             return
         p = QPainter(self.viewport())
@@ -1486,9 +1510,31 @@ class TreeEditor(QPlainTextEdit):
                 self.toggle_fold(hit)
                 e.accept()
                 return
+            if self._col_mode:
+                line, col = self._point_to_linecol(e.position())
+                if e.modifiers() & Qt.KeyboardModifier.ShiftModifier and self._blk is not None:
+                    self._set_block(self._blk[0], self._blk[1], line, col)
+                else:
+                    self._set_block(line, col, line, col)
+                self._blk_drag = True
+                self.setFocus()
+                e.accept()
+                return
         super().mousePressEvent(e)
 
+    def mouseReleaseEvent(self, e) -> None:
+        if self._blk_drag:
+            self._blk_drag = False
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
     def mouseMoveEvent(self, e) -> None:
+        if self._blk_drag and e.buttons() & Qt.MouseButton.LeftButton and self._blk is not None:
+            line, col = self._point_to_linecol(e.position())
+            self._set_block(self._blk[0], self._blk[1], line, col)
+            e.accept()
+            return
         super().mouseMoveEvent(e)
         if not e.buttons():
             shape = (Qt.CursorShape.PointingHandCursor if self._badge_hit(e.position()) is not None
@@ -1508,6 +1554,482 @@ class TreeEditor(QPlainTextEdit):
                 menu.insertAction(first, a)
         menu.insertSeparator(first)
         menu.exec(e.globalPos())
+
+    # ---- column (block) selection - like PyCharm's Alt+Shift+Insert -----------
+    def set_column_mode(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._col_mode:
+            return
+        self._col_mode = on
+        if on:
+            doc = self.document()
+            cur = self.textCursor()
+            a = doc.findBlock(cur.anchor())
+            p = doc.findBlock(cur.position())
+            self._set_block(a.blockNumber(), u16_to_cp(a.text(), cur.anchor() - a.position()),
+                            p.blockNumber(), u16_to_cp(p.text(), cur.position() - p.position()))
+            self.statusMessage.emit("Column selection ON - Shift+arrows or drag to select "
+                                    "a rectangle, then type, Tab, Backspace, copy or paste")
+        else:
+            self._blk = None
+            self.viewport().update()
+            self.statusMessage.emit("Column selection OFF - normal line selection")
+        self.columnModeChanged.emit(on)
+
+    def toggle_column_mode(self) -> None:
+        self.set_column_mode(not self._col_mode)
+
+    def column_mode(self) -> bool:
+        return self._col_mode
+
+    def block_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        """(top line, bottom line, left col, right col) of the column selection."""
+        if self._blk is None:
+            return None
+        al, ac, l, c = self._blk
+        return min(al, l), max(al, l), min(ac, c), max(ac, c)
+
+    def _block_rows(self) -> List[int]:
+        top, bottom, _c1, _c2 = self.block_rect()
+        bottom = min(bottom, self.document().blockCount() - 1)
+        return [n for n in range(top, bottom + 1) if self._block(n).isVisible()]
+
+    def _set_block(self, al: int, ac: int, line: int, col: int) -> None:
+        n = self.document().blockCount() - 1
+        al, line = max(0, min(al, n)), max(0, min(line, n))
+        ac, col = max(0, ac), max(0, col)
+        self._blk = [al, ac, line, col]
+        self._blk_rev = self.document().revision()
+        block = self._block(line)
+        text = block.text()
+        cur = QTextCursor(block)
+        cur.setPosition(block.position() + u16len(text[:min(col, len(text))]))
+        self._blk_internal = True
+        try:
+            self.setTextCursor(cur)
+        finally:
+            self._blk_internal = False
+        self.ensureCursorVisible()
+        self.viewport().update()
+
+    def _block_check_edit(self) -> None:
+        """Any edit that is not a column edit ends the column selection."""
+        if self._blk is not None and not self._blk_internal \
+                and self.document().revision() != self._blk_rev:
+            self._blk = None
+            self.viewport().update()
+
+    def _block_text(self) -> str:
+        _t, _b, c1, c2 = self.block_rect()
+        return "\n".join(self._block(n).text()[c1:c2] for n in self._block_rows())
+
+    def _block_edit(self, edits: List[Tuple[int, int, int, str]]) -> None:
+        """Apply [(line, start col, end col, new text)] as ONE undo step."""
+        doc = self.document()
+        cur = QTextCursor(doc)
+        self._blk_internal = True
+        try:
+            cur.beginEditBlock()
+            for line, start, end, insert in edits:
+                block = doc.findBlockByNumber(line)
+                text = block.text()
+                pad = " " * max(0, start - len(text))
+                a = min(start, len(text))
+                b = max(a, min(end, len(text)))
+                if a == b and not (pad + insert):
+                    continue
+                cur.setPosition(block.position() + u16len(text[:a]))
+                cur.setPosition(block.position() + u16len(text[:b]), QTextCursor.MoveMode.KeepAnchor)
+                cur.insertText(pad + insert)
+            cur.endEditBlock()
+        finally:
+            self._blk_internal = False
+        self._blk_rev = doc.revision()
+
+    def _block_replace(self, insert: str) -> None:
+        """Typing / pasting one line: replaces the rectangle on every row."""
+        top, bottom, c1, c2 = self.block_rect()
+        rows = self._block_rows()
+        self._block_edit([(n, c1, c2, insert) for n in rows])
+        col = c1 + len(insert)
+        self._set_block(self._blk[0], col, self._blk[2], col)
+
+    def _block_delete(self, forward: bool) -> None:
+        top, bottom, c1, c2 = self.block_rect()
+        rows = self._block_rows()
+        if c2 > c1:
+            self._block_edit([(n, c1, c2, "") for n in rows])
+            col = c1
+        elif forward:
+            self._block_edit([(n, c1, c1 + 1, "") for n in rows
+                              if c1 < len(self._block(n).text())])
+            col = c1
+        else:
+            if c1 == 0:
+                return
+            # remove a whole "➡️" (2 characters) when the caret is behind it
+            edits = []
+            for n in rows:
+                text = self._block(n).text()
+                if c1 <= len(text):
+                    start = c1 - 2 if text[c1 - 1] == "\ufe0f" and c1 >= 2 else c1 - 1
+                    edits.append((n, start, c1, ""))
+            self._block_edit(edits)
+            col = c1 - 1
+        al, _ac, l, _c = self._blk
+        self._set_block(al, col, l, col)
+
+    def _block_indent(self, outdent: bool) -> None:
+        top, bottom, c1, c2 = self.block_rect()
+        rows = self._block_rows()
+        al, _ac, l, _c = self._blk
+        if not outdent:
+            self._block_edit([(n, c1, c1, " " * tm.INDENT) for n in rows])
+            ac, c = self._blk[1] + tm.INDENT, self._blk[3] + tm.INDENT
+            self._set_block(al, ac, l, c)
+            return
+        removed = {}
+        for n in rows:
+            text = self._block(n).text()
+            k = 0
+            while k < tm.INDENT and 0 <= c1 - k - 1 < len(text) and text[c1 - k - 1] == " ":
+                k += 1
+            if k:
+                removed[n] = k
+        if not removed:
+            self.statusMessage.emit("No spaces left of the column selection")
+            return
+        self._block_edit([(n, c1 - k, c1, "") for n, k in removed.items()])
+        shift = max(removed.values())
+        self._set_block(al, max(0, self._blk[1] - shift), l, max(0, self._blk[3] - shift))
+
+    def _block_paste(self, text: str) -> None:
+        lines = tm.normalize_paste(text).split("\n")
+        if len(lines) > 1 and lines[-1] == "":
+            lines.pop()                              # trailing line break
+        lines = [ln.replace("\t", " ") for ln in lines]
+        top, bottom, c1, c2 = self.block_rect()
+        rows = self._block_rows()
+        if len(lines) == 1:
+            self._block_replace(lines[0])
+            return
+        n = rows[-1] + 1
+        while len(rows) < len(lines) and n < self.document().blockCount():
+            if self._block(n).isVisible():
+                rows.append(n)                       # extend downwards for more lines
+            n += 1
+        edits = [(row, c1, c2, lines[i] if i < len(lines) else "") for i, row in enumerate(rows)]
+        self._block_edit(edits)
+        last = rows[min(len(rows), len(lines)) - 1]
+        col = c1 + len(lines[min(len(rows), len(lines)) - 1])
+        self._set_block(last, col, last, col)
+
+    def _snap_col(self, line: int, col: int, step: int) -> int:
+        """Keep the column off the inside of "➡️" (two characters)."""
+        text = self._block(line).text()
+        if 0 < col < len(text) and text[col] == "\ufe0f":
+            col += 1 if step > 0 else -1
+        return max(0, col)
+
+    def _visible_neighbour(self, line: int, step: int) -> int:
+        block = self._block(line)
+        nxt = block.next() if step > 0 else block.previous()
+        while nxt.isValid() and not nxt.isVisible():
+            nxt = nxt.next() if step > 0 else nxt.previous()
+        return nxt.blockNumber() if nxt.isValid() else line
+
+    def _column_key(self, e) -> bool:
+        """Keys while column selection is on. True = handled."""
+        key = e.key()
+        mods = e.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        shift = Qt.KeyboardModifier.ShiftModifier
+        nav = (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down,
+               Qt.Key.Key_Home, Qt.Key.Key_End)
+        if key in nav and mods == shift:
+            if self._blk is None:
+                cur = self.textCursor()
+                ln, cl = cur.blockNumber(), u16_to_cp(cur.block().text(), cur.positionInBlock())
+                self._blk = [ln, cl, ln, cl]
+            al, ac, l, c = self._blk
+            if key == Qt.Key.Key_Left:
+                c = self._snap_col(l, c - 1, -1)
+            elif key == Qt.Key.Key_Right:
+                c = self._snap_col(l, c + 1, 1)
+            elif key == Qt.Key.Key_Up:
+                l = self._visible_neighbour(l, -1)
+            elif key == Qt.Key.Key_Down:
+                l = self._visible_neighbour(l, 1)
+            elif key == Qt.Key.Key_Home:
+                c = 0
+            else:
+                c = len(self._block(l).text())
+            self._set_block(al, ac, l, c)
+            return True
+        if self._blk is None:
+            return False
+        al, ac, l, c = self._blk
+        _t, _b, c1, c2 = self.block_rect()
+        if mods == Qt.KeyboardModifier.NoModifier and key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            if c2 > c1:                               # collapse to the left / right edge
+                col = c1 if key == Qt.Key.Key_Left else c2
+            else:                                     # move every caret
+                col = self._snap_col(l, c1 + (-1 if key == Qt.Key.Key_Left else 1),
+                                     -1 if key == Qt.Key.Key_Left else 1)
+            self._set_block(al, col, l, col)
+            return True
+        if key == Qt.Key.Key_Escape:
+            self._blk = None
+            self.viewport().update()
+            return True
+        if e.matches(QKeySequence.StandardKey.Copy) or e.matches(QKeySequence.StandardKey.Cut):
+            QApplication.clipboard().setText(self._block_text())
+            if e.matches(QKeySequence.StandardKey.Cut) and c2 > c1:
+                self._block_delete(forward=True)
+            return True
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Backspace:
+            self._block_delete(forward=False)
+            return True
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Delete:
+            self._block_delete(forward=True)
+            return True
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Tab:
+            self._block_indent(outdent=False)
+            return True
+        if key == Qt.Key.Key_Backtab:
+            self._block_indent(outdent=True)
+            return True
+        text = e.text()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        if text and text.isprintable() and (not ctrl or alt) and (not alt or ctrl):
+            self._block_replace(text)                 # (Ctrl+Alt = AltGr on Windows)
+            return True
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Up, Qt.Key.Key_Down,
+                   Qt.Key.Key_PageUp, Qt.Key.Key_PageDown, Qt.Key.Key_Home, Qt.Key.Key_End) \
+                or e.matches(QKeySequence.StandardKey.SelectAll):
+            self._blk = None                          # back to one normal cursor
+            self.viewport().update()
+        return False
+
+    def _char_w(self) -> float:
+        return QFontMetricsF(self.font()).horizontalAdvance(" ")
+
+    def _col_x(self, block, geo: QRectF, col: int) -> float:
+        text = block.text()
+        layout = block.layout()
+        base = geo.left() + layout.position().x()
+        if layout.lineCount() == 0:
+            return base + col * self._char_w()
+        ln = layout.lineAt(0)
+        if col <= len(text):
+            return base + ln.cursorToX(u16len(text[:col]))[0]
+        return base + ln.cursorToX(u16len(text))[0] + (col - len(text)) * self._char_w()
+
+    def _point_to_linecol(self, pt: QPointF) -> Tuple[int, int]:
+        cur = self.cursorForPosition(pt.toPoint())
+        block = cur.block()
+        text = block.text()
+        col = u16_to_cp(text, cur.positionInBlock())
+        geo = self.blockBoundingGeometry(block).translated(self.contentOffset())
+        end_x = self._col_x(block, geo, len(text))
+        if pt.x() > end_x:
+            col = len(text) + int(round((pt.x() - end_x) / max(1.0, self._char_w())))
+        return block.blockNumber(), col
+
+    def _paint_block(self, e) -> None:
+        top, bottom, c1, c2 = self.block_rect()
+        active_col = self._blk[3]
+        sel = QColor(self.theme.selection)
+        sel.setAlpha(150)
+        caret = QColor(self.theme.fg)
+        p = QPainter(self.viewport())
+        for block, geo in self._painted_blocks(e.rect().top(), e.rect().bottom()):
+            n = block.blockNumber()
+            if n < top or n > bottom:
+                continue
+            x1, x2 = self._col_x(block, geo, c1), self._col_x(block, geo, c2)
+            if x2 > x1:
+                p.fillRect(QRectF(x1, geo.top(), x2 - x1, geo.height()), sel)
+            xc = self._col_x(block, geo, active_col)
+            p.fillRect(QRectF(xc, geo.top() + 1, 1.5, geo.height() - 2), caret)
+        p.end()
+
+    # ---- pasting (multi-line text keeps the tree intact) -------------------
+    def insertFromMimeData(self, source) -> None:
+        if not self._in_drop and source is not None and source.hasText():
+            text = source.text()
+            if self._col_mode and self._blk is not None:
+                self._block_paste(text)
+                return
+            try:
+                if self._smart_paste(text):
+                    return
+            except tm.TreeError as ex:
+                self.statusMessage.emit(str(ex))
+                return
+        super().insertFromMimeData(source)
+
+    def _smart_paste(self, text: str) -> bool:
+        """Paste text copied from PDF / Word / web pages.
+
+        The first line goes where the cursor is; every further line becomes a
+        new branch on the SAME level right below (or, inside an explanation,
+        a further explanation line), so the tree structure below stays intact.
+        Returns False when the normal text paste should be used."""
+        normalized = tm.normalize_paste(text)
+        if "\n" not in normalized:
+            return False                              # ordinary single-line paste
+        if tm.looks_like_tree(text):
+            return False                              # a copied piece of tree: as it is
+        lines = tm.paste_lines(text)
+        first_raw = normalized.replace("\t", " ").replace("\xa0", " ").lstrip(" ")
+        if lines and first_raw.startswith("\n"):
+            lines.insert(0, "")                       # text starts with a line break:
+                                                      # everything goes on new branches
+        elif lines and normalized[:1] in (" ", "\t", "\xa0"):
+            lines[0] = " " + lines[0]                 # keep the space before the 1st word
+        doc = self.document()
+        cur = self.textCursor()
+        if cur.hasSelection() and (doc.findBlock(cur.anchor()).blockNumber()
+                                   != doc.findBlock(cur.position()).blockNumber()):
+            return False                              # selection over several lines
+        if not lines:
+            self.statusMessage.emit("Nothing to paste (only empty lines)")
+            return True
+        if len(lines) == 1:                           # e.g. "text\n" from Word
+            cur.insertText(lines[0] if cur.positionInBlock() else lines[0].lstrip())
+            self.setTextCursor(cur)
+            return True
+        self.ensure_parsed()
+        line = cur.blockNumber()
+        if not (0 <= line < len(self._map)):
+            return False
+        kind, node = self._map.kinds[line], self._map.nodes[line]
+        if node is None or node.parent is None or kind not in (tm.KIND_NODE, tm.KIND_COMMENT,
+                                                               tm.KIND_GAP):
+            return False
+        if cur.hasSelection():                        # replace the selection (same Undo step)
+            cur.removeSelectedText()
+            self.setTextCursor(cur)
+            self._join_next_edit = True
+            self.ensure_parsed()
+            line = cur.blockNumber()
+            kind, node = self._map.kinds[line], self._map.nodes[line]
+            if node is None or node.parent is None:
+                self._join_next_edit = False
+                cur.insertText("\n".join(lines))
+                return True
+        block = cur.block()
+        btext = block.text()
+        col = u16_to_cp(btext, cur.positionInBlock())
+        target = self._paste_target(line, kind, node, btext, col)
+        result: dict = {}
+
+        def op(_n):
+            result.update(self._apply_paste(target, lines))
+            return None, "keep"
+
+        try:
+            if not self.run_op(op, require_node=False):
+                return True
+        finally:
+            self._join_next_edit = False
+        self._cursor_into(result["node"], result["part"], result["offset"])
+        self.statusMessage.emit(f"Pasted {len(lines)} lines - each on its own "
+                                f"{'explanation line' if result['part'] != 'name' else 'branch'}")
+        return True
+
+    def _paste_target(self, line: int, kind: str, node: tm.Node, text: str, col: int):
+        """Where the paste goes: ("name", node, offset) / ("comment", node, k,
+        offset) / ("gap", node)."""
+        if kind == tm.KIND_GAP:
+            return ("gap", node)
+        segs = {part: (s, e) for part, s, e in tm.line_segments(text)}
+        if kind == tm.KIND_COMMENT:
+            k = self._comment_numbers().get(line, 1)
+            cs = segs.get("comment", (len(text), len(text)))[0]
+            if k >= len(node.comment):
+                return ("name", node, len(node.name))
+            return ("comment", node, k, max(0, min(col - cs, len(node.comment[k]))))
+        if "comment" in segs and node.comment:
+            cs = segs["comment"][0]
+            marker = text.rfind("\u27a1", 0, cs)
+            if marker >= 0 and col > marker:
+                return ("comment", node, 0, max(0, min(col - cs, len(node.comment[0]))))
+        ncol = self._map.name_col.get(id(node), 0)
+        return ("name", node, max(0, min(col - ncol, len(node.name))))
+
+    @staticmethod
+    def _apply_paste(target, lines: List[str]) -> dict:
+        kind = target[0]
+        if kind == "comment":
+            _, node, k, off = target
+            head, tail = node.comment[k][:off], node.comment[k][off:]
+            node.comment[k] = head + (lines[0] if head else lines[0].lstrip())
+            for j, extra in enumerate(lines[1:], 1):
+                node.comment.insert(k + j, extra)
+            last = k + len(lines) - 1
+            end = len(node.comment[last])
+            node.comment[last] += tail
+            return {"node": node, "part": ("comment", last), "offset": end}
+        new_nodes = []
+        if kind == "gap" and not lines[0].strip():
+            lines = lines[1:]                         # nothing to merge on an empty line
+        for raw in (lines if kind == "gap" else lines[1:]):
+            name, comment = tm._split_name(raw)
+            new_nodes.append(tm.Node(name, comment))
+        if kind == "gap":
+            owner = target[1]
+            parent, idx = owner.parent, owner.index
+            new_nodes[0].gap_before = max(0, owner.gap_before - 1)   # the line we pasted on
+            owner.gap_before = 0
+            for j, n in enumerate(new_nodes):
+                parent.insert_child(idx + j, n)
+            last = new_nodes[-1]
+            return {"node": last, "part": "name", "offset": len(last.name)}
+        _, node, off = target
+        head, tail = node.name[:off], node.name[off:]
+        name0, comment0 = tm._split_name(lines[0])
+        if head and lines[0][:1] == " " and name0:
+            name0 = " " + name0
+        node.name = head + name0
+        node.comment.extend(comment0)
+        parent, idx = node.parent, node.index
+        for j, n in enumerate(new_nodes, 1):            # same level, right below
+            parent.insert_child(idx + j, n)
+        last = new_nodes[-1]
+        end = len(last.name)
+        last.name += tail
+        return {"node": last, "part": "name", "offset": end}
+
+    def _cursor_into(self, node: tm.Node, part, offset: int) -> None:
+        """Put the text cursor at `offset` inside a node's name or explanation line."""
+        header = self._map.line_of(node)
+        if header is None:
+            return
+        line, k = header, 0
+        if part != "name":
+            k = part[1]
+            if k > 0:
+                seen = 0
+                for i in range(header + 1, len(self._map)):
+                    if self._map.kinds[i] == tm.KIND_COMMENT and self._map.nodes[i] is node:
+                        seen += 1
+                        if seen == k:
+                            line = i
+                            break
+        block = self._block(line)
+        text = block.text()
+        if part == "name":
+            col = self._map.name_col.get(id(node), 0) + offset
+        else:
+            segs = {p: (s, e) for p, s, e in tm.line_segments(text)}
+            col = segs.get("comment", (len(text), len(text)))[0] + offset
+        col = max(0, min(col, len(text)))
+        cur = QTextCursor(block)
+        cur.setPosition(block.position() + u16len(text[:col]))
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
 
     def dragEnterEvent(self, e) -> None:
         if e.mimeData().hasUrls():
@@ -1529,7 +2051,11 @@ class TreeEditor(QPlainTextEdit):
                     break
             e.acceptProposedAction()
         else:
-            super().dropEvent(e)
+            self._in_drop = True                  # dragging text keeps Qt's normal behaviour
+            try:
+                super().dropEvent(e)
+            finally:
+                self._in_drop = False
 
 
 # --------------------------------------------------------------------------- #
@@ -1609,6 +2135,15 @@ def _draw_icon(p: QPainter, kind: str) -> None:
         else:
             line((14, 12), (21, 12))
             line((18, 8.5), (21.5, 12), (18, 15.5))
+    elif kind == "column":                              # rectangle across text lines
+        for y in (5, 12, 19):
+            line((3, y), (21, y))
+        p.save()
+        dash = QPen(p.pen())
+        dash.setDashPattern([1.5, 2.0])
+        p.setPen(dash)
+        p.drawRect(QRectF(8.5, 2.5, 7, 19))
+        p.restore()
     elif kind == "delete_line":                         # one row crossed out
         line((4, 4.5), (20, 4.5))
         line((4, 19.5), (20, 19.5))
@@ -1704,7 +2239,7 @@ def shortcut_text(action: QAction) -> str:
     if not seqs:
         return ""
     text = seqs[0].toString(QKeySequence.SequenceFormat.NativeText)
-    for a, b in (("Return", "Enter"), ("Delete", "Del"), ("Up", "↑"),
+    for a, b in (("Return", "Enter"), ("Delete", "Del"), ("Insert", "Ins"), ("Up", "↑"),
                  ("Down", "↓"), ("Left", "←"), ("Right", "→")):
         text = text.replace(a, b)
     return text
@@ -2013,6 +2548,7 @@ class MainWindow(QMainWindow):
         self.editor.cursorPositionChanged.connect(self._update_position)
         self.editor.openFileRequested.connect(self._open_dropped)
         self.editor.marksChanged.connect(self._marks_changed)
+        self.editor.columnModeChanged.connect(self._column_mode_changed)
         self.editor.document().modificationChanged.connect(self.setWindowModified)
 
         dark = self.settings.value("dark", None)
@@ -2082,6 +2618,12 @@ class MainWindow(QMainWindow):
         self.a_find = A("&Find…", self.findbar.open_bar, QKeySequence.StandardKey.Find)
         self.a_find_next = A("Find &next", self.findbar.find_next, "F3")
         self.a_find_prev = A("Find &previous", self.findbar.find_prev, "Shift+F3")
+        self.a_column = A("Column selection", lambda c: e.set_column_mode(bool(c)),
+                          "Alt+Shift+Insert",
+                          "Column selection: select a rectangle over several lines (Shift+arrows "
+                          "or drag) and type, Tab / Shift+Tab, Backspace, copy or paste on all of "
+                          "them at once. Press again for normal line selection.")
+        self.a_column.setCheckable(True)
 
         self.a_collapse_all = A("Collapse all", e.collapse_all, "Alt+1",
                                 "Collapse every branch")
@@ -2202,6 +2744,8 @@ class MainWindow(QMainWindow):
         m.addActions([self.a_undo, self.a_redo])
         m.addSeparator()
         m.addActions([self.a_find, self.a_find_next, self.a_find_prev])
+        m.addSeparator()
+        m.addAction(self.a_column)
 
         m = mb.addMenu("&Tree")
         m.addActions([self.a_add_sibling, self.a_add_child, self.a_spacer, self.a_edit, self.a_explain,
@@ -2250,6 +2794,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         self._add_tool_buttons(tb, [
             (self.a_expl_left, "Explanations ←"), (self.a_expl_right, "Explanations →"),
+            (self.a_column, "Column select"),
         ])
         tb.addSeparator()
         self.mark_menu = QMenu(self)
@@ -2301,7 +2846,7 @@ class MainWindow(QMainWindow):
                 (self.a_edit, "edit"), (self.a_delete, "delete"),
                 (self.a_up, "up"), (self.a_down, "down"), (self.a_left, "left"),
                 (self.a_right, "right"), (self.a_format, "format"),
-                (self.a_delete_line, "delete_line"),
+                (self.a_delete_line, "delete_line"), (self.a_column, "column"),
                 (self.a_expl_left, "expl_left"), (self.a_expl_right, "expl_right")):
             action.setIcon(make_icon(kind, danger if kind in ("delete", "delete_line") else color))
         theme = self.editor.theme
@@ -2321,11 +2866,23 @@ class MainWindow(QMainWindow):
         sb = self.statusBar()
         self.path_label = QLabel()
         self.pos_label = QLabel()
+        self.column_label = QLabel(" COLUMN ")
+        self.column_label.setToolTip("Column selection is on (Alt+Shift+Insert to switch off)")
+        self.column_label.setStyleSheet("font-weight: 600; color: palette(highlighted-text); "
+                                        "background: palette(highlight); border-radius: 3px;")
+        self.column_label.hide()
         self.pos_label.setMinimumWidth(self.pos_label.fontMetrics().horizontalAdvance("Ln 99999, Col 999") + 12)
         sb.addPermanentWidget(self.path_label, 1)
+        sb.addPermanentWidget(self.column_label)
         sb.addPermanentWidget(self.pos_label)
 
     # ---- status ----------------------------------------------------------
+    def _column_mode_changed(self, on: bool) -> None:
+        self.a_column.blockSignals(True)
+        self.a_column.setChecked(on)
+        self.a_column.blockSignals(False)
+        self.column_label.setVisible(on)
+
     def _update_level_display(self) -> None:
         mx = self.editor.max_level()
         cur = self.editor.current_level()
@@ -2598,6 +3155,8 @@ class MainWindow(QMainWindow):
             ("Edit name & explanation", f"{EDIT_SHORTCUT}  (explanation only: Ctrl+E)"),
             ("Duplicate / delete branch", "Ctrl+D / Ctrl+Shift+Delete"),
             ("Delete line (sub-items kept)", "Ctrl+Q"),
+            ("Column selection on / off", "Alt+Shift+Insert  (then Shift+arrows or drag)"),
+            ("Paste several lines", "each line becomes its own branch on the same level"),
             ("Remove an empty new item", "Backspace"),
             ("Move explanations left / right", "Alt+← / Alt+→  (selection, or whole document)"),
             ("Format document (auto-align all)", "Ctrl+Alt+L  (saving tidies lines, keeps # columns)"),

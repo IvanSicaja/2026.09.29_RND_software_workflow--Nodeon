@@ -819,3 +819,43 @@ def delete_row(doc: TreeDocument, kind: str, node: Optional[Node],
         del doc.preamble[preamble_index]
     else:
         raise TreeError("Nothing to delete here")
+
+
+# --------------------------------------------------------------------------- #
+# Pasting text from other programs (PDF, Word, web pages ...)
+# --------------------------------------------------------------------------- #
+_LINE_BREAKS = ("\r\n", "\r", " ", " ", "\x0b", "\x0c", "\x85")
+_PASTE_TREE_RE = re.compile(r"├──|└──")
+
+
+def normalize_paste(text: str) -> str:
+    """Unify the line breaks Word, PDF viewers and browsers put on the clipboard."""
+    for br in _LINE_BREAKS:
+        text = text.replace(br, "\n")
+    return text
+
+
+def paste_lines(text: str) -> List[str]:
+    """The non-empty lines of pasted text, trimmed, tabs/NBSP turned into spaces.
+    Lines made only of tree guides ("│") count as empty."""
+    out = []
+    for raw in normalize_paste(text).split("\n"):
+        line = raw.replace("\xa0", " ").replace("\t", " ").strip()
+        if line and not all(c in _GUIDES for c in line):
+            out.append(line)
+    return out
+
+
+def looks_like_tree(text: str) -> bool:
+    """True if the pasted text already contains tree connectors (├── / └──),
+    e.g. a part copied from a tree; it is then pasted as it is."""
+    return bool(_PASTE_TREE_RE.search(text))
+
+
+def replace_columns(text: str, start: int, end: int, insert: str) -> str:
+    """Replace the characters [start, end) of a line with `insert`; a start
+    beyond the end of the line is reached by padding with spaces."""
+    if start > len(text):
+        text = text + " " * (start - len(text))
+    end = max(start, min(end, len(text)))
+    return text[:start] + insert + text[end:]
