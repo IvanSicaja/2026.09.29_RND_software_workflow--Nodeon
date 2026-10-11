@@ -67,12 +67,16 @@ Press `F1` in the app for the full shortcut list.
 
 Colour only the **name** of a branch (tree lines and explanations stay as they are):
 
-| Mark | Shortcut |
-|---|---|
-| Checked / OK (green) | `Alt+G` |
-| To explore (orange) | `Alt+O` |
-| Problem (red) | `Alt+R` |
-| Default colour (remove mark) | `Alt+C` (or press the same key again) |
+| Colour | Meaning (standard legend) | Whole name | Word / selection |
+|---|---|---|---|
+| default text colour | Not checked yet (only mentioned) | `Alt+C` | `Alt+Shift+C` |
+| green | Accepted (checked by a human) | `Alt+G` | `Alt+Shift+G` |
+| orange | To be approved | `Alt+O` | `Alt+Shift+O` |
+| red | Rejected | `Alt+R` | `Alt+Shift+R` |
+| violet | Explanation (`➡️`, fixed colour) | – | – |
+| own colours | whatever you define | `Alt+5` … `Alt+9` | `Alt+Shift+5` … `Alt+Shift+9` |
+
+Pressing the same colour key again removes the colour.
 
 Works on the line at the cursor or on every branch in a selection.
 Toolbar: **Mark line** (whole name, `Alt+G/O/R/C`) and **Mark words** (word at the cursor or
@@ -90,6 +94,32 @@ The `.txt` stays pure text: marks are saved automatically in a small file next t
 `<name>.txt.marks.json`. Keep it with the `.txt` when you copy or share the tree.
 Explanations (`➡️`) are always shown in their own violet colour; they can never be
 coloured – the colour marks work on branch names only.
+
+## Colour legend and own colours
+
+The **legend** below the editor always shows every colour and what it means
+(hide / show it in **View → Show colour legend**). Click a colour in the legend for its
+commands:
+
+* colour the whole name or only the word / selection,
+* **Edit meaning…** (built-in colours keep their theme colour; own colours can also get a
+  new colour),
+* **Remove colour** (own colours only – if it is used, Nodeon asks first; those names and
+  words get the default text colour again).
+
+**+ Add colour** adds an own colour with its meaning, e.g. *Same on both robots*. The
+first five own colours get the shortcuts `Alt+5` … `Alt+9` (whole name) and
+`Alt+Shift+5` … `Alt+Shift+9` (word); every own colour is also in the legend, the
+**Mark line** / **Mark words** menus, the Tree menu and the right-click menu. A colour
+or meaning that is already used is refused, so the legend stays unambiguous.
+
+Each tree keeps its own legend in `<name>.txt.marks.json`.
+
+**Save as default** stores the current legend (all meanings and own colours) as the
+standard for **every new tree**, in `nodeon_colours.json` in your user settings folder
+(the exact path is shown in the tooltip and after saving). **Load default** adds the colours
+of that default legend to the tree that is open. To share one legend with a team, set the
+environment variable `NODEON_COLORS_FILE` to a common file.
 
 ## Explanation alignment
 

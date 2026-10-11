@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sys
 import traceback
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -28,8 +29,8 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
-from PySide6.QtCore import (QByteArray, QEvent, QIODevice, QPointF, QRect, QRectF,
-                            QSaveFile, QSettings, QSize, Qt, QTimer, Signal)
+from PySide6.QtCore import (QByteArray, QEvent, QIODevice, QPoint, QPointF, QRect, QRectF,
+                            QSaveFile, QSettings, QSize, QStandardPaths, Qt, QTimer, Signal)
 from PySide6.QtGui import (QAction, QColor, QFont, QFontDatabase, QFontMetrics, QFontMetricsF,
                            QIcon, QPainterPath, QPen, QPixmap,
                            QKeySequence, QPainter, QPalette, QPolygonF,
@@ -37,6 +38,7 @@ from PySide6.QtGui import (QAction, QColor, QFont, QFontDatabase, QFontMetrics, 
                            QTextFormat)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
                                QMenu, QStyle, QStyleOptionToolButton, QStylePainter,
+                               QColorDialog, QLayout, QPushButton, QSizePolicy,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
                                QSpinBox, QTextEdit, QToolBar, QToolButton,
@@ -127,15 +129,13 @@ APP_NAME = "Nodeon"
 APP_VERSION = "1.0.0"
 COLLAPSED = 1                      # QTextBlock.userState() bit of a folded branch
 
-# Status marks for branch names (bits 1-2 of QTextBlock.userState()).
+# Status marks for branch names (bits 1-8 of QTextBlock.userState(): 0 = none,
+# 1-3 = built-in colours, 8-255 = custom colours from the legend).
 MARK_NONE, MARK_CHECKED, MARK_EXPLORE, MARK_PROBLEM = 0, 1, 2, 3
-MARK_NAMES = {MARK_CHECKED: "checked", MARK_EXPLORE: "explore", MARK_PROBLEM: "problem"}
-MARK_LABELS = {MARK_CHECKED: "Checked", MARK_EXPLORE: "To explore", MARK_PROBLEM: "Problem"}
 # Word colours can also be "default": shows the normal text colour even inside a
 # name that has a whole-line colour.
 MARK_DEFAULT = 4
-SPAN_MARK_NAMES = {**MARK_NAMES, MARK_DEFAULT: "default"}
-_MARK_BITS = 0b110
+_MARK_BITS = 0xFF << 1
 
 
 def _state(block) -> int:
@@ -155,16 +155,230 @@ def set_collapsed(block, on: bool) -> None:
 
 
 def mark_of(block) -> int:
-    return (_state(block) & _MARK_BITS) >> 1
+    return (_state(block) >> 1) & 0xFF
 
 
 def set_mark_bits(block, mark: int) -> bool:
     s = _state(block)
-    new = (s & ~_MARK_BITS) | ((mark & 3) << 1)
+    new = (s & ~_MARK_BITS) | ((mark & 0xFF) << 1)
     if new != s:
         block.setUserState(new if new else -1)
         return True
     return False
+# --------------------------------------------------------------------------- #
+# Colour legend: what every colour means (built-in + custom colours)
+# --------------------------------------------------------------------------- #
+LEGEND_TEXT_LABEL = "Not checked yet (only mentioned)"
+LEGEND_EXPLANATION_LABEL = "Explanation"
+BUILTIN_COLOURS = ((MARK_CHECKED, "checked", "Accepted"),
+                   (MARK_EXPLORE, "explore", "To be approved"),
+                   (MARK_PROBLEM, "problem", "Rejected"))
+BUILTIN_LETTERS = {"checked": "G", "explore": "O", "problem": "R"}
+CUSTOM_FIRST_MARK = 8                  # mark ids 5-7 stay free, 4 = "default" word colour
+CUSTOM_LAST_MARK = 255
+CUSTOM_MAX = 200
+CUSTOM_SLOTS = (5, 6, 7, 8, 9)         # Alt+5 ... Alt+9 / Alt+Shift+5 ... Alt+Shift+9
+LABEL_MAX = 80
+# Suggested colours for new custom entries: readable on dark and light
+# backgrounds and clearly different from names, explanations and the 3 marks.
+SUGGESTED_COLOURS = ("#ec4899", "#0891b2", "#ca8a04", "#0d9488", "#d946ef", "#65a30d",
+                     "#a16207", "#be185d", "#0e7490", "#7c2d12")
+_HEX_COLOUR_RE = re.compile(r"#[0-9a-fA-F]{6}")
+_CUSTOM_KEY_RE = re.compile(r"c-[0-9a-f]{8}")
+DEFAULT_COLOURS_ENV = "NODEON_COLORS_FILE"
+
+
+def default_colours_path() -> str:
+    """File that holds the default colour legend (used for every new tree).
+
+    The environment variable NODEON_COLORS_FILE can point to another file,
+    e.g. a shared one for a whole team."""
+    env = os.environ.get(DEFAULT_COLOURS_ENV, "").strip()
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppConfigLocation)
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".nodeon")
+    return os.path.join(base, "nodeon_colours.json")
+
+
+class ColourEntry:
+    """One colour of the legend. Built-in entries have color None (their
+    colour follows the light / dark theme)."""
+    __slots__ = ("key", "label", "color", "mark", "slot")
+
+    def __init__(self, key: str, label: str, color: Optional[str], mark: int,
+                 slot: Optional[int] = None) -> None:
+        self.key, self.label, self.color, self.mark, self.slot = key, label, color, mark, slot
+
+    @property
+    def builtin(self) -> bool:
+        return self.color is None
+
+    def __repr__(self) -> str:
+        return f"ColourEntry({self.key!r}, {self.label!r}, {self.color!r}, mark={self.mark})"
+
+
+def _clean_label(value, fallback: str = "") -> str:
+    text = " ".join(str(value).split()) if isinstance(value, str) else ""
+    return text[:LABEL_MAX] or fallback
+
+
+class Palette:
+    """The colour legend of one tree: built-in + custom colours and meanings."""
+
+    def __init__(self) -> None:
+        self.text_label = LEGEND_TEXT_LABEL
+        self.explanation_label = LEGEND_EXPLANATION_LABEL
+        self.entries: List[ColourEntry] = [ColourEntry(key, label, None, mark)
+                                           for mark, key, label in BUILTIN_COLOURS]
+
+    # -- lookup ----------------------------------------------------------
+    @classmethod
+    def factory(cls) -> "Palette":
+        return cls()
+
+    def copy(self) -> "Palette":
+        p = Palette()
+        p.text_label, p.explanation_label = self.text_label, self.explanation_label
+        p.entries = [ColourEntry(e.key, e.label, e.color, e.mark, e.slot) for e in self.entries]
+        return p
+
+    def customs(self) -> List[ColourEntry]:
+        return [e for e in self.entries if not e.builtin]
+
+    def by_key(self, key: str) -> Optional[ColourEntry]:
+        return next((e for e in self.entries if e.key == key), None)
+
+    def by_mark(self, mark: int) -> Optional[ColourEntry]:
+        return next((e for e in self.entries if e.mark == mark), None)
+
+    def has_mark(self, mark: int) -> bool:
+        return self.by_mark(mark) is not None
+
+    def label(self, mark: int) -> str:
+        e = self.by_mark(mark)
+        return e.label if e else ""
+
+    def colour(self, mark: int, theme) -> Optional[str]:
+        e = self.by_mark(mark)
+        if e is None:
+            return None
+        if e.color is not None:
+            return e.color
+        return {MARK_CHECKED: theme.mark_checked, MARK_EXPLORE: theme.mark_explore,
+                MARK_PROBLEM: theme.mark_problem}[e.mark]
+
+    def custom_colours(self) -> Dict[int, str]:
+        return {e.mark: e.color for e in self.customs()}
+
+    # -- changes ---------------------------------------------------------
+    def _free_mark(self) -> int:
+        used = {e.mark for e in self.entries}
+        for m in range(CUSTOM_FIRST_MARK, CUSTOM_LAST_MARK + 1):
+            if m not in used:
+                return m
+        raise ValueError("No more colours can be added")
+
+    def _free_slot(self) -> Optional[int]:
+        used = {e.slot for e in self.entries}
+        return next((s for s in CUSTOM_SLOTS if s not in used), None)
+
+    def _new_key(self) -> str:
+        while True:
+            key = "c-" + secrets.token_hex(4)
+            if self.by_key(key) is None:
+                return key
+
+    def add_custom(self, label: str, color: str) -> ColourEntry:
+        if len(self.customs()) >= CUSTOM_MAX:
+            raise ValueError(f"The legend can hold at most {CUSTOM_MAX} own colours")
+        if not _HEX_COLOUR_RE.fullmatch(color or ""):
+            raise ValueError(f"Not a colour: {color!r}")
+        entry = ColourEntry(self._new_key(), _clean_label(label, "Custom colour"),
+                            color.lower(), self._free_mark(), self._free_slot())
+        self.entries.append(entry)
+        return entry
+
+    def remove(self, key: str) -> ColourEntry:
+        e = self.by_key(key)
+        if e is None or e.builtin:
+            raise ValueError("Built-in colours can't be removed - change their meaning instead")
+        self.entries.remove(e)
+        return e
+
+    def suggest_colour(self) -> str:
+        used = {e.color for e in self.customs()}
+        for c in SUGGESTED_COLOURS:
+            if c not in used:
+                return c
+        hue = (len(used) * 137) % 360                  # golden angle: well spread
+        return QColor.fromHsv(hue, 200, 190).name()
+
+    def merge(self, other: "Palette") -> List[ColourEntry]:
+        """Add the custom colours of `other` that this legend does not have yet."""
+        added = []
+        for e in other.customs():
+            if self.by_key(e.key) is None and len(self.customs()) < CUSTOM_MAX:
+                ne = ColourEntry(e.key, e.label, e.color, self._free_mark(),
+                                 e.slot if e.slot is not None and e.slot not in
+                                 {x.slot for x in self.entries} else self._free_slot())
+                self.entries.append(ne)
+                added.append(ne)
+        return added
+
+    # -- files -------------------------------------------------------------
+    def to_json(self) -> dict:
+        colours = []
+        for e in self.entries:
+            item = {"key": e.key, "label": e.label}
+            if not e.builtin:
+                item["color"] = e.color
+                if e.slot is not None:
+                    item["slot"] = e.slot
+            colours.append(item)
+        return {"text": self.text_label, "explanation": self.explanation_label,
+                "colours": colours}
+
+    def same_as(self, other: "Palette") -> bool:
+        return self.to_json() == other.to_json()
+
+    @classmethod
+    def from_json(cls, data) -> "Palette":
+        """Build a legend from file data. Invalid parts are skipped; the three
+        built-in colours always exist."""
+        p = cls()
+        if not isinstance(data, dict):
+            raise ValueError("The colour legend is not a JSON object")
+        p.text_label = _clean_label(data.get("text"), LEGEND_TEXT_LABEL)
+        p.explanation_label = _clean_label(data.get("explanation"), LEGEND_EXPLANATION_LABEL)
+        items = data.get("colours", [])
+        if not isinstance(items, list):
+            raise ValueError("'colours' must be a list")
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("key")
+            builtin = p.by_key(key) if isinstance(key, str) else None
+            if builtin is not None and builtin.builtin:
+                builtin.label = _clean_label(item.get("label"), builtin.label)
+                continue
+            color = item.get("color")
+            if not (isinstance(key, str) and _CUSTOM_KEY_RE.fullmatch(key)
+                    and isinstance(color, str) and _HEX_COLOUR_RE.fullmatch(color)
+                    and p.by_key(key) is None and len(p.customs()) < CUSTOM_MAX):
+                continue
+            label = _clean_label(item.get("label"))
+            if not label:
+                continue
+            slot = item.get("slot")
+            if not (isinstance(slot, int) and slot in CUSTOM_SLOTS
+                    and slot not in {e.slot for e in p.entries}):
+                slot = None
+            p.entries.append(ColourEntry(key, label, color.lower(), p._free_mark(), slot))
+        return p
+
+
 NEW_DOCUMENT = "new-project/\n│\n└── "
 # Shortcut for "Edit name & explanation". Change it here if you prefer another one.
 EDIT_SHORTCUT = "Ctrl+Shift+E"
@@ -258,6 +472,7 @@ class TreeHighlighter(QSyntaxHighlighter):
         super().__init__(document)
         # Returns [(start, end, mark, bold)] of coloured words for a line number.
         self.span_provider: Callable[[int], list] = lambda line: ()
+        self.custom_colours: Dict[int, str] = {}       # mark id -> colour (legend)
         self.set_theme(theme, rehighlight=False)
 
     def set_theme(self, theme: Theme, rehighlight: bool = True) -> None:
@@ -272,11 +487,23 @@ class TreeHighlighter(QSyntaxHighlighter):
         self.f_comment = fmt(theme.comment)
         self.f_folder = fmt(theme.folder, bold=True)
         self.f_file = fmt(theme.file)
-        self.mark_colors = {MARK_CHECKED: theme.mark_checked, MARK_EXPLORE: theme.mark_explore,
-                            MARK_PROBLEM: theme.mark_problem}
-        self.f_marks = {(m, bold): fmt(c, bold=bold)
-                        for m, c in self.mark_colors.items() for bold in (False, True)}
+        self._fmt = fmt
+        self._theme = theme
+        self._build_mark_formats()
         if rehighlight:
+            self.rehighlight()
+
+    def _build_mark_formats(self) -> None:
+        theme = self._theme
+        self.mark_colors = {MARK_CHECKED: theme.mark_checked, MARK_EXPLORE: theme.mark_explore,
+                            MARK_PROBLEM: theme.mark_problem, **self.custom_colours}
+        self.f_marks = {(m, bold): self._fmt(c, bold=bold)
+                        for m, c in self.mark_colors.items() for bold in (False, True)}
+
+    def set_custom_colours(self, colours: Dict[int, str]) -> None:
+        if colours != self.custom_colours:
+            self.custom_colours = dict(colours)
+            self._build_mark_formats()
             self.rehighlight()
 
     def highlightBlock(self, text: str) -> None:
@@ -303,10 +530,8 @@ class TreeHighlighter(QSyntaxHighlighter):
             start = text.index(name, i)
             folder = name.endswith(("/", "\\"))
             mark = mark_of(self.currentBlock())
-            if mark:
-                fmt = self.f_marks[(mark, folder)]
-            else:
-                fmt = self.f_folder if folder else self.f_file
+            normal = self.f_folder if folder else self.f_file
+            fmt = self.f_marks.get((mark, folder), normal) if mark else normal
             self.setFormat(start, len(name), fmt)
         self._paint_spans(n)                          # coloured words (names only)
         if hm:
@@ -316,10 +541,8 @@ class TreeHighlighter(QSyntaxHighlighter):
         for start, end, mark, bold in self.span_provider(self.currentBlock().blockNumber()):
             start, end = max(0, start), min(n, end)
             if end > start:
-                if mark == MARK_DEFAULT:
-                    fmt = self.f_folder if bold else self.f_file
-                else:
-                    fmt = self.f_marks[(mark, bold)]
+                normal = self.f_folder if bold else self.f_file
+                fmt = normal if mark == MARK_DEFAULT else self.f_marks.get((mark, bold), normal)
                 self.setFormat(start, end - start, fmt)
 
 
@@ -361,6 +584,7 @@ class TreeEditor(QPlainTextEdit):
         # Status marks by node key; the line states are the live copy, this
         # registry restores marks after Undo and is what gets saved.
         self.marks: Dict[tm.NodeKey, int] = {}
+        self.colours = Palette.factory()           # colour legend of this tree
         self._join_next_edit = False
         self._in_drop = False
         # Column (block) selection: [anchor line, anchor col, line, col] in
@@ -406,7 +630,7 @@ class TreeEditor(QPlainTextEdit):
         pal.setColor(QPalette.ColorRole.Highlight, QColor(theme.selection))
         pal.setColor(QPalette.ColorRole.HighlightedText, QColor(theme.fg))
         self.setPalette(pal)
-        self.highlighter.set_theme(theme)
+        self._recolour(lambda: self.highlighter.set_theme(theme))
         self._highlight_current_line()
         self.gutter.update()
         self.viewport().update()
@@ -823,9 +1047,57 @@ class TreeEditor(QPlainTextEdit):
             last -= 1                    # selection ends at the start of a line
         return first, last, True
 
+    def _recolour(self, fn: Callable[[], None]) -> None:
+        """Re-colouring the text counts as a change for Qt, although the text is
+        the same - keep the tree information (fold arrows, badges) valid."""
+        was_ok = self._rev_ok()
+        fn()
+        if was_ok:
+            self._parsed_rev = self.document().revision()
+            self.gutter.update()
+            self.viewport().update()
+
+    def set_palette(self, palette: Palette) -> None:
+        """Use another colour legend (marks must be (re)loaded afterwards)."""
+        self.colours = palette
+        self._recolour(lambda: self.highlighter.set_custom_colours(palette.custom_colours()))
+
+    def palette_changed(self) -> None:
+        """The legend was edited (colour, meaning, new colour)."""
+        self._recolour(lambda: self.highlighter.set_custom_colours(self.colours.custom_colours()))
+
+    def mark_uses(self, mark: int) -> int:
+        """How many names / coloured words use this colour."""
+        self.ensure_parsed()
+        lines = sum(1 for _n, m in self._marked_nodes() if m == mark)
+        words = sum(1 for _k, sp in self.export_spans() if sp[3] == mark)
+        return lines + words
+
+    def clear_mark(self, mark: int) -> None:
+        """Remove a colour everywhere: those names and words get the default
+        text colour again."""
+        self.ensure_parsed()
+        self.marks = {k: m for k, m in self.marks.items() if m != mark}
+        for key in list(self.spans):
+            rest = [sp for sp in self.spans[key] if sp[3] != mark]
+            if rest:
+                self.spans[key] = rest
+            else:
+                del self.spans[key]
+        block = self.document().begin()
+        while block.isValid():
+            if mark_of(block) == mark and set_mark_bits(block, MARK_NONE):
+                self.highlighter.rehighlightBlock(block)
+            block = block.next()
+        self._resolve_spans()
+        self.marksChanged.emit()
+
     def mark_selection(self, mark: int) -> None:
         """Colour the names of the branch at the cursor (or of every branch in
         the selection). Pressing the same mark again removes it."""
+        if mark and not self.colours.has_mark(mark):
+            self.statusMessage.emit("This colour is no longer in the legend")
+            return
         self.ensure_parsed()
         first, last, _ = self._selected_lines()
         nodes: List[tm.Node] = []
@@ -860,7 +1132,7 @@ class TreeEditor(QPlainTextEdit):
                     del self.spans[key]
         self._resolve_spans()
         what = f"{len(nodes)} branches" if len(nodes) > 1 else f"“{nodes[0].name or '(empty)'}”"
-        self.statusMessage.emit(f"{what}: {MARK_LABELS[mark]}" if mark
+        self.statusMessage.emit(f"{what}: {self.colours.label(mark)}" if mark
                                 else f"{what}: default colour")
         self.marksChanged.emit()
 
@@ -872,10 +1144,11 @@ class TreeEditor(QPlainTextEdit):
     def load_marks(self, entries: List[Tuple[tm.NodeKey, int]],
                    spans: Optional[List[Tuple[tm.NodeKey, tm.Span]]] = None) -> None:
         self.ensure_parsed()
-        self.marks = {key: m for key, m in entries if m in MARK_NAMES}
+        self.marks = {key: m for key, m in entries if self.colours.has_mark(m)}
         self.spans = {}
         for key, sp in spans or []:
-            if sp[3] in SPAN_MARK_NAMES and sp[2] > sp[1] and sp[0] == "name":
+            if (sp[3] == MARK_DEFAULT or self.colours.has_mark(sp[3])) \
+                    and sp[2] > sp[1] and sp[0] == "name":
                 self.spans.setdefault(key, []).append(sp)
         self._sync_marks()
         self._resolve_spans()
@@ -973,6 +1246,9 @@ class TreeEditor(QPlainTextEdit):
         """Colour only the selected characters / the word at the cursor in
         branch names. Explanations and tree lines are never coloured. Same
         colour again removes it."""
+        if mark and not self.colours.has_mark(mark):
+            self.statusMessage.emit("This colour is no longer in the legend")
+            return
         self.ensure_parsed()
         cur = self.textCursor()
         doc = self.document()
@@ -1036,7 +1312,7 @@ class TreeEditor(QPlainTextEdit):
             else:
                 self.spans.pop(key, None)
         self._resolve_spans()
-        self.statusMessage.emit(f"{what}: {MARK_LABELS[mark]}" if mark
+        self.statusMessage.emit(f"{what}: {self.colours.label(mark)}" if mark
                                 else f"{what}: default colour")
         self.marksChanged.emit()
 
@@ -2336,6 +2612,250 @@ class ActionButton(QToolButton):
 # --------------------------------------------------------------------------- #
 # Dialogs and find bar
 # --------------------------------------------------------------------------- #
+class FlowLayout(QLayout):
+    """Lays out widgets left to right and wraps to the next row when needed."""
+
+    def __init__(self, parent: Optional[QWidget] = None, hspacing: int = 4,
+                 vspacing: int = 2) -> None:
+        super().__init__(parent)
+        self._items: list = []
+        self._h, self._v = hspacing, vspacing
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, i: int):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i: int):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, apply=True)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect: QRect, apply: bool) -> int:
+        m = self.contentsMargins()
+        r = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, row_h = r.x(), r.y(), 0
+        for item in self._items:
+            hint = item.sizeHint()
+            if x + hint.width() > r.right() + 1 and row_h > 0:
+                x, y = r.x(), y + row_h + self._v
+                row_h = 0
+            if apply:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._h
+            row_h = max(row_h, hint.height())
+        return y + row_h - rect.y() + m.bottom()
+
+
+class ColourDialog(QDialog):
+    """Add a colour to the legend, or edit a colour's meaning (and, for own
+    colours, the colour itself)."""
+
+    def __init__(self, parent: QWidget, palette: Palette, theme: "Theme",
+                 entry: Optional[ColourEntry] = None, fixed: Optional[str] = None) -> None:
+        super().__init__(parent)
+        self.colours, self.theme, self.entry, self.fixed = palette, theme, entry, fixed
+        if fixed == "text":
+            title, label, color = "Edit meaning", palette.text_label, theme.fg
+        elif fixed == "explanation":
+            title, label, color = "Edit meaning", palette.explanation_label, theme.comment
+        elif entry is not None:
+            title, label = "Edit colour", entry.label
+            color = palette.colour(entry.mark, theme)
+        else:
+            title, label, color = "Add colour", "", palette.suggest_colour()
+        self.color = color
+        self.setWindowTitle(title)
+        self.setMinimumWidth(460)
+        form = QFormLayout(self)
+        self.meaning = QLineEdit(label)
+        self.meaning.setMaxLength(LABEL_MAX)
+        self.meaning.setPlaceholderText("What does this colour mean? e.g. Same on both robots")
+        form.addRow("Meaning", self.meaning)
+        self.color_btn = QPushButton()
+        self.color_btn.clicked.connect(self._pick)
+        editable = fixed is None and (entry is None or not entry.builtin)
+        self.color_btn.setEnabled(editable)
+        note = QLabel("" if editable else
+                      ("Built-in colour - it follows the light / dark theme."
+                       if fixed is None else "Fixed colour of the editor."))
+        note.setStyleSheet("color: palette(placeholder-text);")
+        row = QHBoxLayout()
+        row.addWidget(self.color_btn)
+        row.addWidget(note, 1)
+        form.addRow("Colour", row)
+        self.preview = QLabel()
+        self.preview.setFont(parent.editor.font() if hasattr(parent, "editor") else self.font())
+        self.preview.setContentsMargins(8, 6, 8, 6)
+        form.addRow("Preview", self.preview)
+        self.error = QLabel()
+        self.error.setStyleSheet(f"color: {theme.mark_problem};")
+        self.error.setWordWrap(True)
+        form.addRow(self.error)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.meaning.textChanged.connect(self._refresh)
+        self._refresh()
+        self.meaning.setFocus()
+        self.meaning.selectAll()
+
+    def _refresh(self) -> None:
+        self.color_btn.setText(f"  {self.color}")
+        self.color_btn.setIcon(make_dots_icon([self.color]))
+        sample = self.meaning.text().strip() or "example name"
+        self.preview.setText(sample)
+        self.preview.setStyleSheet(f"background: {self.theme.bg}; color: {self.color}; "
+                                   "border-radius: 4px;")
+        self.error.setText("")
+
+    def _pick(self) -> None:
+        c = QColorDialog.getColor(QColor(self.color), self, "Choose a colour")
+        if c.isValid():
+            self.set_colour(c.name())
+
+    def set_colour(self, color: str) -> None:
+        self.color = QColor(color).name()
+        self._refresh()
+
+    def values(self) -> Tuple[str, str]:
+        return " ".join(self.meaning.text().split()), self.color
+
+    def validate(self) -> Optional[str]:
+        """Error message, or None when the input can be used."""
+        label, color = self.values()
+        if not label:
+            return "Please describe what this colour means."
+        own = self.entry.key if self.entry is not None else None
+        names = [(e.key, e.label) for e in self.colours.entries]
+        names += [("text", self.colours.text_label), ("explanation", self.colours.explanation_label)]
+        for key, other in names:
+            if key != own and key != self.fixed and other.casefold() == label.casefold():
+                return f"“{other}” is already in the legend - please use another meaning."
+        if not self.color_btn.isEnabled():
+            return None
+        t = self.theme
+        taken = {QColor(t.comment).name(): self.colours.explanation_label,
+                 QColor(t.fg).name(): self.colours.text_label,
+                 QColor(t.file).name(): self.colours.text_label,
+                 QColor(t.folder).name(): "folder names",
+                 QColor(t.guide).name(): "the tree lines"}
+        for e in self.colours.entries:
+            if e.key != own:
+                taken[QColor(self.colours.colour(e.mark, t)).name()] = e.label
+        if QColor(color).name() in taken:
+            return (f"This colour is already used for “{taken[QColor(color).name()]}” - "
+                    "please choose a different one.")
+        return None
+
+    def accept(self) -> None:
+        err = self.validate()
+        if err:
+            self.error.setText(err)
+            return
+        super().accept()
+
+
+class LegendBar(QWidget):
+    """Always-visible legend: every colour and what it means. Click a colour
+    for its commands; add, edit, remove colours and save them as default."""
+
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__()
+        self.window_ = window
+        self.setObjectName("legend_bar")
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.flow = FlowLayout(self, hspacing=2, vspacing=0)
+        self.flow.setContentsMargins(8, 2, 8, 2)
+        self.chips: List[QToolButton] = []
+
+    def rebuild(self) -> None:
+        while self.flow.count():
+            item = self.flow.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self.chips = []
+        w = self.window_
+        pal, theme = w.editor.colours, w.editor.theme
+        title = QLabel("Legend:")
+        title.setStyleSheet("color: palette(placeholder-text);")
+        self.flow.addWidget(title)
+        self._chip("text", pal.text_label, theme.fg,
+                   "Default text colour - only mentioned, not checked by a human yet.\n"
+                   "Back to this colour: Alt+C (whole name) / Alt+Shift+C (word)")
+        for e in pal.entries:
+            keys = w.colour_shortcut_text(e)
+            self._chip(e.key, e.label, pal.colour(e.mark, theme),
+                       f"{e.label}\n{keys}\nClick for commands, to edit or to remove."
+                       if keys else f"{e.label}\nClick for commands, to edit or to remove.")
+        self._chip("explanation", pal.explanation_label, theme.comment,
+                   "Colour of every explanation (➡️) - fixed, it can't be changed.")
+        gap = QLabel()
+        gap.setFixedWidth(10)
+        self.flow.addWidget(gap)
+        for text, tip, slot in (("+ Add colour", "Add an own colour with its meaning",
+                                 w.add_colour),
+                                ("Save as default", "Use this legend for every new tree "
+                                 f"(saved in {default_colours_path()})", w.save_default_colours),
+                                ("Load default", "Add the colours of the saved default legend "
+                                 "to this tree", w.load_default_colours)):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setAutoRaise(False)                    # framed: commands, not colours
+            b.clicked.connect(slot)
+            b.setObjectName("legend_" + text.strip("+ ").lower().replace(" ", "_"))
+            self.flow.addWidget(b)
+        self.flow.invalidate()
+        self.updateGeometry()
+
+    def _chip(self, key: str, label: str, color: str, tip: str) -> QToolButton:
+        chip = QToolButton()
+        chip.setText(label)
+        chip.setIcon(make_dots_icon([color]))
+        chip.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        chip.setAutoRaise(True)
+        chip.setToolTip(tip)
+        chip.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        chip.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
+        chip.setMenu(self.window_.legend_menu(key, chip))
+        chip.legend_key = key
+        chip.legend_color = QColor(color).name()
+        self.flow.addWidget(chip)
+        self.chips.append(chip)
+        return chip
+
+    def chip(self, key: str) -> Optional[QToolButton]:
+        return next((c for c in self.chips if c.legend_key == key), None)
+
+
 class EditNodeDialog(QDialog):
     def __init__(self, parent: QWidget, node: tm.Node, font: QFont,
                  focus_explanation: bool) -> None:
@@ -2517,14 +3037,20 @@ class MainWindow(QMainWindow):
         _migrate_old_settings(self.settings)
         self.path: Optional[str] = None
         self.newline = "\n"
+        self.custom_line_actions: Dict[str, QAction] = {}
+        self.custom_word_actions: Dict[str, QAction] = {}
+        self._default_colours_warning = ""
+        self.default_palette = self._read_default_colours()
 
         self.editor = TreeEditor()
         self.findbar = FindBar(self.editor)
+        self.legend = LegendBar(self)
         central = QWidget()
         lay = QVBoxLayout(central)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(self.editor)
+        lay.addWidget(self.legend)
         lay.addWidget(self.findbar)
         self.setCentralWidget(central)
 
@@ -2565,8 +3091,14 @@ class MainWindow(QMainWindow):
             self.resize(max(avail.width() // 2, 400), avail.height())
         self.settings.setValue("ui_version", UI_VERSION)
 
+        show_legend = self.settings.value("show_legend", True, type=bool)
+        self.legend.setVisible(show_legend)
+        self.a_legend.setChecked(show_legend)
+
         if not (path and self.load_file(path)):
             self.new_file(ask=False)
+        if self._default_colours_warning:
+            self.statusBar().showMessage(self._default_colours_warning, 10000)
 
     def showEvent(self, e) -> None:
         super().showEvent(e)
@@ -2672,29 +3204,20 @@ class MainWindow(QMainWindow):
         self.a_expl_right = A("Move explanations right", lambda: e.shift_explanations(1),
                               "Alt+Right", "Move explanations (➡️) right - selected lines, or the "
                               "whole document if nothing is selected")
-        self.a_mark_checked = A("Mark as checked", lambda: e.mark_selection(MARK_CHECKED),
-                                "Alt+G", "Colour the name green: checked / OK "
-                                "(press again to remove)")
-        self.a_mark_explore = A("Mark to explore", lambda: e.mark_selection(MARK_EXPLORE),
-                                "Alt+O", "Colour the name orange: still to explore "
-                                "(press again to remove)")
-        self.a_mark_problem = A("Mark as problem", lambda: e.mark_selection(MARK_PROBLEM),
-                                "Alt+R", "Colour the name red: something is not OK "
-                                "(press again to remove)")
+        self.a_mark_checked = A("Colour line: Accepted", lambda: e.mark_selection(MARK_CHECKED),
+                                "Alt+G")
+        self.a_mark_explore = A("Colour line: To be approved",
+                                lambda: e.mark_selection(MARK_EXPLORE), "Alt+O")
+        self.a_mark_problem = A("Colour line: Rejected", lambda: e.mark_selection(MARK_PROBLEM),
+                                "Alt+R")
         self.a_mark_clear = A("Default colour (remove mark)", lambda: e.mark_selection(MARK_NONE),
                               "Alt+C", "Give the whole name its default text colour again")
-        self.a_word_checked = A("Colour word / selection: checked",
-                                lambda: e.mark_words(MARK_CHECKED), "Alt+Shift+G",
-                                "Colour the word at the cursor (or the selected characters) "
-                                "green - press again to remove")
-        self.a_word_explore = A("Colour word / selection: to explore",
-                                lambda: e.mark_words(MARK_EXPLORE), "Alt+Shift+O",
-                                "Colour the word at the cursor (or the selected characters) "
-                                "orange - press again to remove")
-        self.a_word_problem = A("Colour word / selection: problem",
-                                lambda: e.mark_words(MARK_PROBLEM), "Alt+Shift+R",
-                                "Colour the word at the cursor (or the selected characters) "
-                                "red - press again to remove")
+        self.a_word_checked = A("Colour word / selection: Accepted",
+                                lambda: e.mark_words(MARK_CHECKED), "Alt+Shift+G")
+        self.a_word_explore = A("Colour word / selection: To be approved",
+                                lambda: e.mark_words(MARK_EXPLORE), "Alt+Shift+O")
+        self.a_word_problem = A("Colour word / selection: Rejected",
+                                lambda: e.mark_words(MARK_PROBLEM), "Alt+Shift+R")
         self.a_word_clear = A("Default colour for word / selection",
                               lambda: e.mark_words(MARK_NONE), "Alt+Shift+C",
                               "Give the word at the cursor (or the selected characters) "
@@ -2703,14 +3226,24 @@ class MainWindow(QMainWindow):
                              self.a_mark_clear]
         self.word_actions = [self.a_word_checked, self.a_word_explore, self.a_word_problem,
                              self.a_word_clear]
+        self.builtin_line_actions = {"checked": self.a_mark_checked,
+                                     "explore": self.a_mark_explore,
+                                     "problem": self.a_mark_problem}
+        self.builtin_word_actions = {"checked": self.a_word_checked,
+                                     "explore": self.a_word_explore,
+                                     "problem": self.a_word_problem}
         self.a_mark_menu = QAction("Mark line", self)
-        self.a_mark_menu.setToolTip("Mark line - colour the whole branch name (line at the "
-                                    "cursor or selected lines):\nChecked Alt+G · To explore "
-                                    "Alt+O · Problem Alt+R · Default colour Alt+C")
         self.a_words_menu = QAction("Mark words", self)
-        self.a_words_menu.setToolTip("Mark words - colour only the word at the cursor or the "
-                                     "selected characters:\nChecked Alt+Shift+G · To explore "
-                                     "Alt+Shift+O · Problem Alt+Shift+R · Default colour Alt+Shift+C")
+        self.a_add_colour = A("Add colour to the legend…", self.add_colour, None,
+                              "Add an own colour with its meaning (e.g. same on both robots)")
+        self.a_save_colours = A("Save legend as default", self.save_default_colours, None,
+                                "Use this legend (all colours and meanings) for every new tree")
+        self.a_load_colours = A("Load default legend", self.load_default_colours, None,
+                                "Add the colours of the saved default legend to this tree")
+        self.a_legend = A("Show colour legend", self._toggle_legend, None,
+                          "Show the legend that explains every colour")
+        self.a_legend.setCheckable(True)
+        self.a_legend.setChecked(True)
 
         self.a_zoom_in = A("Zoom in", lambda: self._zoom(1), ["Ctrl+=", "Ctrl++"])
         self.a_zoom_out = A("Zoom out", lambda: self._zoom(-1), "Ctrl+-")
@@ -2722,12 +3255,16 @@ class MainWindow(QMainWindow):
         self.a_about = A("About", self.show_about)
 
         e.reserve_shortcuts(self.actions())
-        e.context_actions = [self.a_edit, self.a_explain, None, self.a_add_sibling,
-                             self.a_add_child, self.a_spacer, self.a_duplicate, self.a_delete_line,
-                             self.a_delete, None,
-                             self.a_up, self.a_down, self.a_left, self.a_right, None,
-                             self.a_toggle, self.a_collapse_branch, self.a_expand_branch, None,
-                             *self.mark_actions, None, *self.word_actions]
+        self._update_context_actions()
+
+    def _update_context_actions(self) -> None:
+        self.editor.context_actions = [
+            self.a_edit, self.a_explain, None, self.a_add_sibling,
+            self.a_add_child, self.a_spacer, self.a_duplicate, self.a_delete_line,
+            self.a_delete, None,
+            self.a_up, self.a_down, self.a_left, self.a_right, None,
+            self.a_toggle, self.a_collapse_branch, self.a_expand_branch, None,
+            *self.mark_actions, None, *self.word_actions]
 
     def _build_menus(self) -> None:
         mb = self.menuBar()
@@ -2747,17 +3284,8 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction(self.a_column)
 
-        m = mb.addMenu("&Tree")
-        m.addActions([self.a_add_sibling, self.a_add_child, self.a_spacer, self.a_edit, self.a_explain,
-                      self.a_duplicate, self.a_delete_line, self.a_delete])
-        m.addSeparator()
-        m.addActions([self.a_up, self.a_down, self.a_left, self.a_right])
-        m.addSeparator()
-        m.addActions([self.a_expl_left, self.a_expl_right, self.a_format])
-        m.addSeparator()
-        m.addActions(self.mark_actions)
-        m.addSeparator()
-        m.addActions(self.word_actions)
+        self.tree_menu = mb.addMenu("&Tree")
+        self._fill_tree_menu()
 
         m = mb.addMenu("&View")
         m.addActions([self.a_collapse_all, self.a_collapse_level, self.a_expand_level,
@@ -2769,7 +3297,7 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addActions([self.a_zoom_in, self.a_zoom_out, self.a_zoom_reset])
         m.addSeparator()
-        m.addActions([self.a_dark, self.a_settings])
+        m.addActions([self.a_legend, self.a_dark, self.a_settings])
 
         m = mb.addMenu("&Help")
         m.addActions([self.a_shortcuts, self.a_about])
@@ -2850,6 +3378,11 @@ class MainWindow(QMainWindow):
                 (self.a_expl_left, "expl_left"), (self.a_expl_right, "expl_right")):
             action.setIcon(make_icon(kind, danger if kind in ("delete", "delete_line") else color))
         theme = self.editor.theme
+        for e in self.editor.colours.customs():
+            for store in (self.custom_line_actions, self.custom_word_actions):
+                if e.key in store:
+                    store[e.key].setIcon(make_dots_icon([e.color]))
+        self.legend.rebuild()
         self.a_mark_checked.setIcon(make_dots_icon([theme.mark_checked]))
         self.a_mark_explore.setIcon(make_dots_icon([theme.mark_explore]))
         self.a_mark_problem.setIcon(make_dots_icon([theme.mark_problem]))
@@ -2920,12 +3453,263 @@ class MainWindow(QMainWindow):
             return self.save()
         return r == QMessageBox.StandardButton.Discard
 
+    def _fill_tree_menu(self) -> None:
+        m = self.tree_menu
+        m.clear()
+        m.addActions([self.a_add_sibling, self.a_add_child, self.a_spacer, self.a_edit,
+                      self.a_explain, self.a_duplicate, self.a_delete_line, self.a_delete])
+        m.addSeparator()
+        m.addActions([self.a_up, self.a_down, self.a_left, self.a_right])
+        m.addSeparator()
+        m.addActions([self.a_expl_left, self.a_expl_right, self.a_format])
+        m.addSeparator()
+        m.addActions(self.mark_actions)
+        m.addSeparator()
+        m.addActions(self.word_actions)
+        m.addSeparator()
+        m.addActions([self.a_add_colour, self.a_save_colours, self.a_load_colours])
+
+    # ---- colour legend -----------------------------------------------------
+    def colour_shortcut_text(self, e: ColourEntry) -> str:
+        if e.builtin:
+            k = BUILTIN_LETTERS[e.key]
+        elif e.slot is not None:
+            k = str(e.slot)
+        else:
+            return ""
+        return f"Whole name: Alt+{k}  ·  Word / selection: Alt+Shift+{k}"
+
+    def _rebuild_colour_actions(self) -> None:
+        """Menus, shortcuts and icons follow the legend (meanings, own colours)."""
+        pal, theme, ed = self.editor.colours, self.editor.theme, self.editor
+        for e in pal.entries:
+            if e.builtin:
+                la, wa = self.builtin_line_actions[e.key], self.builtin_word_actions[e.key]
+                la.setText(f"Colour line: {e.label}")
+                wa.setText(f"Colour word / selection: {e.label}")
+                for a, what in ((la, "the whole name"), (wa, "the word at the cursor (or the "
+                                                             "selected characters)")):
+                    keys = ", ".join(s.toString(QKeySequence.SequenceFormat.NativeText)
+                                     for s in a.shortcuts())
+                    a.setToolTip(f"Colour {what}: {e.label}  ({keys}) - press again to remove")
+                    a.setStatusTip(f"Colour {what}: {e.label}")
+        for store in (self.custom_line_actions, self.custom_word_actions):
+            for a in store.values():
+                for w in (self, self.mark_menu, self.words_menu, self.tree_menu):
+                    w.removeAction(a)
+                a.deleteLater()
+            store.clear()
+        for e in pal.customs():
+            for store, word in ((self.custom_line_actions, False),
+                                (self.custom_word_actions, True)):
+                if word:
+                    text = f"Colour word / selection: {e.label}"
+                    keys = f"Alt+Shift+{e.slot}" if e.slot else None
+                    slot = (lambda checked=False, m=e.mark: ed.mark_words(m))
+                else:
+                    text = f"Colour line: {e.label}"
+                    keys = f"Alt+{e.slot}" if e.slot else None
+                    slot = (lambda checked=False, m=e.mark: ed.mark_selection(m))
+                a = self._act(text.replace("&", "&&"), slot, keys,
+                              f"{text} - press again to remove")
+                a.setIcon(make_dots_icon([e.color]))
+                store[e.key] = a
+            ed.reserve_shortcuts([self.custom_line_actions[e.key], self.custom_word_actions[e.key]])
+        self.mark_actions = ([self.builtin_line_actions[k] for k in ("checked", "explore", "problem")]
+                             + [self.custom_line_actions[e.key] for e in pal.customs()]
+                             + [self.a_mark_clear])
+        self.word_actions = ([self.builtin_word_actions[k] for k in ("checked", "explore", "problem")]
+                             + [self.custom_word_actions[e.key] for e in pal.customs()]
+                             + [self.a_word_clear])
+        self.mark_menu.clear()
+        self.mark_menu.addActions(self.mark_actions)
+        self.words_menu.clear()
+        self.words_menu.addActions(self.word_actions)
+        self._fill_tree_menu()
+        self._update_context_actions()
+        lines = [f"{e.label}: Alt+{BUILTIN_LETTERS[e.key] if e.builtin else e.slot}"
+                 for e in pal.entries if e.builtin or e.slot]
+        self.a_mark_menu.setToolTip("Mark line - colour the whole branch name (line at the cursor "
+                                    "or selected lines):\n" + "\n".join(lines)
+                                    + "\nDefault colour: Alt+C")
+        self.a_words_menu.setToolTip("Mark words - colour only the word at the cursor or the "
+                                     "selected characters:\n"
+                                     + "\n".join(l.replace("Alt+", "Alt+Shift+") for l in lines)
+                                     + "\nDefault colour: Alt+Shift+C")
+        cols = [pal.colour(m, theme) for m in (MARK_CHECKED, MARK_EXPLORE, MARK_PROBLEM)]
+        self.a_mark_menu.setIcon(make_mark_icon("line", cols, theme.guide))
+        self.a_words_menu.setIcon(make_mark_icon("words", cols, theme.guide))
+        self.legend.rebuild()
+
+    def _palette_loaded(self) -> None:
+        self.editor.palette_changed()
+        self._rebuild_colour_actions()
+
+    def _apply_palette_change(self, message: str) -> None:
+        self.editor.palette_changed()
+        self._rebuild_colour_actions()
+        self._marks_changed()                    # the legend is stored with the tree
+        self.statusBar().showMessage(message, 5000)
+
+    def legend_menu(self, key: str, parent: QWidget) -> QMenu:
+        menu = QMenu(parent)
+        pal = self.editor.colours
+        if key == "text":
+            menu.addAction(self.a_mark_clear)
+            menu.addAction(self.a_word_clear)
+            menu.addSeparator()
+            menu.addAction("Edit meaning…", lambda: self.edit_colour("text"))
+        elif key == "explanation":
+            info = menu.addAction("Explanations always keep this colour")
+            info.setEnabled(False)
+            menu.addAction("Edit meaning…", lambda: self.edit_colour("explanation"))
+        else:
+            e = pal.by_key(key)
+            if e is None:
+                return menu
+            line = (self.builtin_line_actions if e.builtin else self.custom_line_actions).get(key)
+            word = (self.builtin_word_actions if e.builtin else self.custom_word_actions).get(key)
+            for a in (line, word):
+                if a is not None:
+                    menu.addAction(a)
+            menu.addSeparator()
+            menu.addAction("Edit meaning…" if e.builtin else "Edit meaning && colour…",
+                           lambda: self.edit_colour(key))
+            rm = menu.addAction("Remove colour", lambda: self.remove_colour(key))
+            if e.builtin:
+                rm.setEnabled(False)
+                rm.setToolTip("Built-in colours can't be removed")
+        menu.addSeparator()
+        menu.addAction(self.a_add_colour)
+        return menu
+
+    def _colour_dialog(self, entry: Optional[ColourEntry] = None,
+                       fixed: Optional[str] = None) -> Optional[Tuple[str, str]]:
+        dlg = ColourDialog(self, self.editor.colours, self.editor.theme, entry, fixed)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dlg.values()
+
+    def add_colour(self) -> None:
+        pal = self.editor.colours
+        if len(pal.customs()) >= CUSTOM_MAX:
+            QMessageBox.information(self, APP_NAME, f"The legend already has {CUSTOM_MAX} own "
+                                    "colours - remove one first.")
+            return
+        result = self._colour_dialog()
+        if result is None:
+            return
+        label, color = result
+        e = pal.add_custom(label, color)
+        keys = self.colour_shortcut_text(e)
+        self._apply_palette_change(f"Colour “{e.label}” added to the legend"
+                                   + (f" - {keys}" if keys else
+                                      " - use it from the legend or the Mark menus"))
+
+    def edit_colour(self, key: str) -> None:
+        pal = self.editor.colours
+        if key in ("text", "explanation"):
+            result = self._colour_dialog(fixed=key)
+            if result is None:
+                return
+            if key == "text":
+                pal.text_label = result[0]
+            else:
+                pal.explanation_label = result[0]
+            self._apply_palette_change("Legend updated")
+            return
+        e = pal.by_key(key)
+        if e is None:
+            return
+        result = self._colour_dialog(entry=e)
+        if result is None:
+            return
+        e.label = result[0]
+        if not e.builtin:
+            e.color = QColor(result[1]).name()
+        self._apply_palette_change(f"Colour “{e.label}” updated")
+
+    def remove_colour(self, key: str) -> None:
+        pal = self.editor.colours
+        e = pal.by_key(key)
+        if e is None or e.builtin:
+            self.statusBar().showMessage("Built-in colours can't be removed - change their "
+                                         "meaning instead", 5000)
+            return
+        uses = self.editor.mark_uses(e.mark)
+        if uses:
+            answer = QMessageBox.question(
+                self, "Remove colour",
+                f"“{e.label}” is used {uses} time(s) in this tree.\n\n"
+                "Remove the colour? Those names and words get the default text colour again.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.editor.clear_mark(e.mark)
+        pal.remove(key)
+        self._apply_palette_change(f"Colour “{e.label}” removed from the legend")
+
+    def _read_default_colours(self) -> Palette:
+        path = default_colours_path()
+        self._default_colours_warning = ""
+        if not os.path.isfile(path):
+            return Palette.factory()
+        try:
+            with open(path, encoding="utf-8") as f:
+                return Palette.from_json(json.load(f))
+        except (OSError, ValueError, TypeError, AttributeError) as ex:
+            self._default_colours_warning = (f"The default colour legend could not be read "
+                                             f"({path}: {ex}) - using the standard colours.")
+            return Palette.factory()
+
+    def save_default_colours(self) -> bool:
+        path = default_colours_path()
+        data = {"app": APP_NAME, "kind": "colour-legend", "version": 1,
+                **self.editor.colours.to_json()}
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            f = QSaveFile(path)
+            if not f.open(QIODevice.OpenModeFlag.WriteOnly):
+                raise OSError(f.errorString())
+            f.write(QByteArray(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")))
+            if not f.commit():
+                raise OSError(f.errorString())
+        except OSError as ex:
+            QMessageBox.critical(self, APP_NAME, f"The legend could not be saved as default:\n"
+                                 f"{path}\n\n{ex}")
+            return False
+        self.default_palette = self.editor.colours.copy()
+        self._marks_changed()
+        self.statusBar().showMessage(f"Legend saved as default for every new tree: {path}", 8000)
+        return True
+
+    def load_default_colours(self) -> None:
+        default = self._read_default_colours()
+        if self._default_colours_warning:
+            self.statusBar().showMessage(self._default_colours_warning, 10000)
+            return
+        self.default_palette = default
+        pal = self.editor.colours
+        pal.text_label, pal.explanation_label = default.text_label, default.explanation_label
+        for d in default.entries:
+            if d.builtin:
+                pal.by_key(d.key).label = d.label
+        added = pal.merge(default)
+        self._apply_palette_change(f"Default legend loaded - {len(added)} colour(s) added")
+
+    def _toggle_legend(self, on: bool) -> None:
+        self.legend.setVisible(bool(on))
+        self.settings.setValue("show_legend", bool(on))
+
     def new_file(self, ask: bool = True) -> None:
         if ask and not self.maybe_save():
             return
         self.path = None
         self.newline = os.linesep if os.linesep in ("\n", "\r\n") else "\n"
         self.editor.set_document_text(NEW_DOCUMENT)
+        self.editor.set_palette(self.default_palette.copy())
+        self._palette_loaded()
         self.editor.moveCursor(QTextCursor.MoveOperation.End)
         self._update_title()
 
@@ -3016,13 +3800,20 @@ class MainWindow(QMainWindow):
         return path + ".marks.json"
 
     def _load_marks(self, path: str) -> None:
+        """Read <file>.marks.json: the tree's colour legend and its marks."""
         mp = self.marks_path(path)
+        self.editor.set_palette(self.default_palette.copy())
         if not os.path.isfile(mp):
+            self._palette_loaded()
             return
-        by_name = {v: k for k, v in MARK_NAMES.items()}
         try:
             with open(mp, encoding="utf-8") as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("not a JSON object")
+            palette = (Palette.from_json(data["legend"]) if "legend" in data
+                       else self.default_palette.copy())
+            by_name = {e.key: e.mark for e in palette.entries}
             entries = []
             for item in data.get("marks", []):
                 key = tuple((str(name), int(nth)) for name, nth in item["path"])
@@ -3030,7 +3821,7 @@ class MainWindow(QMainWindow):
                 if key and mark:
                     entries.append((key, mark))
             spans = []
-            span_by_name = {v: k for k, v in SPAN_MARK_NAMES.items()}
+            span_by_name = {**by_name, "default": MARK_DEFAULT}
             for item in data.get("words", []):
                 key = tuple((str(name), int(nth)) for name, nth in item["path"])
                 mark = span_by_name.get(item.get("mark"))
@@ -3042,26 +3833,33 @@ class MainWindow(QMainWindow):
                         and 0 <= start < end and len(text) == end - start:
                     spans.append((key, (part, start, end, mark, text)))
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as ex:
+            self._palette_loaded()
             self.statusBar().showMessage(f"Colour marks could not be read ({ex}); "
                                          "the tree itself is fine.", 8000)
             return
+        self.editor.set_palette(palette)
+        self._palette_loaded()
         self.editor.load_marks(entries, spans)
 
     def _save_marks(self, path: str) -> bool:
         mp = self.marks_path(path)
-        entries = self.editor.export_marks()
-        spans = self.editor.export_spans()
+        pal = self.editor.colours
+        names = {e.mark: e.key for e in pal.entries}
+        names[MARK_DEFAULT] = "default"
+        entries = [(k, m) for k, m in self.editor.export_marks() if m in names]
+        spans = [(k, sp) for k, sp in self.editor.export_spans() if sp[3] in names]
         try:
-            if not entries and not spans:
+            if not entries and not spans and pal.same_as(self.default_palette):
                 if os.path.isfile(mp):
                     os.remove(mp)
                 return True
-            data = {"app": APP_NAME, "version": 1, "file": os.path.basename(path),
+            data = {"app": APP_NAME, "version": 2, "file": os.path.basename(path),
+                    "legend": pal.to_json(),
                     "marks": [{"path": [[name, nth] for name, nth in key],
-                               "mark": MARK_NAMES[m]} for key, m in entries],
+                               "mark": names[m]} for key, m in entries],
                     "words": [{"path": [[name, nth] for name, nth in key], "part": sp[0],
                                "start": sp[1], "end": sp[2], "text": sp[4],
-                               "mark": SPAN_MARK_NAMES[sp[3]]} for key, sp in spans]}
+                               "mark": names[sp[3]]} for key, sp in spans]}
             f = QSaveFile(mp)
             if not f.open(QIODevice.OpenModeFlag.WriteOnly):
                 raise OSError(f.errorString())
@@ -3148,6 +3946,8 @@ class MainWindow(QMainWindow):
             ("Colour marks (names only)", ""),
             ("Checked (green) / To explore (orange)", "Alt+G / Alt+O"),
             ("Problem (red) / Default colour", "Alt+R / Alt+C  (same key again also removes)"),
+            ("Own colours from the legend (first five)",
+             "Alt+5 … Alt+9 whole name,  Alt+Shift+5 … Alt+Shift+9 word"),
             ("Colour the word at the cursor or the selection",
              "Alt+Shift+G / O / R,  default colour: Alt+Shift+C"),
             ("Move right / left one level", "Tab / Shift+Tab  (or Alt+Shift+→ / ←)"),
