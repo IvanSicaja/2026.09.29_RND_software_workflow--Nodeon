@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "main"))
 
 try:
     from PySide6.QtCore import QSettings, Qt
-    from PySide6.QtCore import QEvent, QPoint, QPointF
+    from PySide6.QtCore import QEvent, QPoint, QPointF, QTimer
     from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QTextCursor
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog
@@ -69,10 +69,18 @@ class GuiTests(unittest.TestCase):
         cls.colours_file = os.path.join(cls.tmp, "default_colours.json")
         cls._orig_env = os.environ.get(app_module.DEFAULT_COLOURS_ENV)
         os.environ[app_module.DEFAULT_COLOURS_ENV] = cls.colours_file
+        # A message box that a test did not expect fails the test instead of
+        # waiting forever for a click.
+        cls._orig_box_exec = app_module.QMessageBox.exec
+
+        def unexpected(box):
+            raise AssertionError(f"unexpected message box: {box.text()}")
+        app_module.QMessageBox.exec = unexpected
 
     @classmethod
     def tearDownClass(cls):
         app_module.QSettings = cls._orig_settings
+        app_module.QMessageBox.exec = cls._orig_box_exec
         if cls._orig_env is None:
             os.environ.pop(app_module.DEFAULT_COLOURS_ENV, None)
         else:
@@ -1209,7 +1217,8 @@ class GuiTests(unittest.TestCase):
 
     def test_add_custom_colour_legend_menus_and_shortcuts(self):
         e = self.add_custom()
-        self.assertEqual((e.label, e.color, e.slot), ("Same on both robots", self.CYAN, 5))
+        self.assertEqual((e.label, e.color, e.line_key, e.word_key),
+                         ("Same on both robots", self.CYAN, "Alt+5", "Alt+Shift+5"))
         self.assertIn((e.key, "Same on both robots", self.CYAN), self.chip_info())
         keys = [c.legend_key for c in self.win.legend.chips]
         self.assertEqual(keys[-2:], [e.key, "explanation"])
@@ -1254,7 +1263,7 @@ class GuiTests(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(data["version"], 2)
         self.assertIn({"key": e.key, "label": "Same on both robots", "color": self.CYAN,
-                       "slot": 5}, data["legend"]["colours"])
+                       "line_key": "Alt+5", "word_key": "Alt+Shift+5"}, data["legend"]["colours"])
         self.assertEqual([m["mark"] for m in data["marks"]], [e.key])
         self.assertEqual([w["mark"] for w in data["words"]], [e.key])
         with open(self.path, encoding="utf-8") as f:
@@ -1359,7 +1368,8 @@ class GuiTests(unittest.TestCase):
     def test_edit_builtin_and_fixed_meanings(self):
         self.patch_dialog("Approved by me")
         self.win.edit_colour("checked")
-        self.assertFalse(self.last_dialog.color_btn.isEnabled())     # theme colour is fixed
+        self.assertTrue(self.last_dialog.color_btn.isEnabled())      # colour can be changed
+        self.assertFalse(self.last_dialog.standard_btn.isHidden())   # ... and reset
         self.assertEqual(self.win.legend.chip("checked").text(), "Approved by me")
         self.assertEqual(self.win.a_mark_checked.text(), "Colour line: Approved by me")
         self.mark(2, K.Key_G)
@@ -1393,10 +1403,12 @@ class GuiTests(unittest.TestCase):
         self.assertIsNone(self.last_error)
         self.assertEqual(len(self.ed.colours.customs()), 2)
 
-    def test_slots_and_more_than_five_colours(self):
+    def test_suggested_shortcuts_and_more_than_five_colours(self):
         added = [self.add_custom(f"Colour {i}", c) for i, c in
                  enumerate(["#111111", "#222222", "#333333", "#444444", "#555555", "#666666"])]
-        self.assertEqual([e.slot for e in added], [5, 6, 7, 8, 9, None])
+        self.assertEqual([e.line_key for e in added],
+                         ["Alt+5", "Alt+6", "Alt+7", "Alt+8", "Alt+9", ""])
+        self.assertEqual([e.word_key for e in added][-2:], ["Alt+Shift+9", ""])
         sixth = added[-1]
         self.assertEqual(self.win.custom_line_actions[sixth.key].shortcuts(), [])
         self.assertEqual(self.win.colour_shortcut_text(sixth), "")
@@ -1407,7 +1419,7 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(set(self.colors_of(3, "main.py")), {"#555555"})
         self.win.remove_colour(added[0].key)                       # unused: frees Alt+5
         new = self.add_custom("Colour new", "#777777")
-        self.assertEqual(new.slot, 5)
+        self.assertEqual(new.line_key, "Alt+5")
 
     def test_save_as_default_used_for_every_new_tree(self):
         e = self.add_custom()
@@ -1418,7 +1430,7 @@ class GuiTests(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(data["kind"], "colour-legend")
         self.assertIn({"key": e.key, "label": "Same on both robots", "color": self.CYAN,
-                       "slot": 5}, data["colours"])
+                       "line_key": "Alt+5", "word_key": "Alt+Shift+5"}, data["colours"])
         self.win.new_file(ask=False)                                # same window
         self.assertEqual([x.key for x in self.ed.colours.customs()], [e.key])
         self.assertEqual(self.ed.colours.by_key("checked").label, "Approved")
@@ -1446,6 +1458,7 @@ class GuiTests(unittest.TestCase):
     def test_load_default_merges_into_tree(self):
         a = self.add_custom("From default", "#111111")
         self.win.save_default_colours()
+        self.win._ask_remove_default = lambda e, uses: "here"      # keep it in the default
         self.win.remove_colour(a.key)
         b = self.add_custom("Only here", "#222222")
         self.mark(2, K.Key_5)                                       # b now has slot 5
@@ -1453,7 +1466,7 @@ class GuiTests(unittest.TestCase):
         keys = [x.key for x in self.ed.colours.customs()]
         self.assertEqual(keys, [b.key, a.key])
         self.assertEqual(set(self.colors_of(2, "src/")), {"#222222"})  # marks kept
-        self.assertNotEqual(self.ed.colours.by_key(a.key).slot, 5)   # no clash
+        self.assertNotEqual(self.ed.colours.by_key(a.key).line_key, "Alt+5")   # no clash
         self.assertIn("1 colour(s) added", self.win.statusBar().currentMessage())
 
     def test_broken_default_file_falls_back(self):
@@ -1470,28 +1483,46 @@ class GuiTests(unittest.TestCase):
 
     def test_palette_file_validation(self):
         P = app_module.Palette
-        p = P.from_json({"text": "  Mentioned   only ", "colours": [
-            {"key": "checked", "label": "OK"},
-            {"key": "c-0000000a", "label": "Good", "color": "#ABCDEF", "slot": 6},
+        p = P.from_json({"text": "  Mentioned   only ", "text_color": "#ABCDEF",
+                         "explanation_color": "nope", "colours": [
+            {"key": "checked", "label": "OK", "color": "#00AA00", "line_key": "Alt+J"},
+            {"key": "c-0000000a", "label": "Good", "color": "#ABCDE1", "slot": 6},   # old file
             {"key": "c-0000000a", "label": "Duplicate key", "color": "#123456"},
             {"key": "c-0000000b", "label": "Bad colour", "color": "red"},
             {"key": "bad key", "label": "x", "color": "#123456"},
             {"key": "c-0000000c", "label": "", "color": "#123456"},
-            {"key": "c-0000000d", "label": "x" * 200, "color": "#123456", "slot": 6},
+            {"key": "c-0000000d", "label": "x" * 200, "color": "#123457", "slot": 6},
+            {"key": "c-0000000e", "label": "Same keys", "color": "#123458",
+             "line_key": "Alt+J", "word_key": "Alt+Shift+O"},
+            {"key": "c-0000000f", "label": "Bad keys", "color": "#123459",
+             "line_key": "Alt+1, Alt+2", "word_key": 42},
             "not a dict"]})
-        self.assertEqual(p.text_label, "Mentioned only")
-        self.assertEqual(p.by_key("checked").label, "OK")
+        self.assertEqual((p.text_label, p.text_color, p.explanation_color),
+                         ("Mentioned only", "#abcdef", None))
+        b = p.by_key("checked")
+        self.assertEqual((b.label, b.color, b.line_key, b.word_key),
+                         ("OK", "#00aa00", "Alt+J", "Alt+Shift+G"))
         self.assertEqual([e.key for e in p.entries], ["checked", "explore", "problem",
-                                                      "c-0000000a", "c-0000000d"])
-        self.assertEqual(p.by_key("c-0000000a").color, "#abcdef")
-        self.assertEqual(p.by_key("c-0000000d").slot, None)            # slot 6 already taken
+                                                      "c-0000000a", "c-0000000d",
+                                                      "c-0000000e", "c-0000000f"])
+        self.assertEqual(p.by_key("c-0000000a").line_key, "Alt+6")      # from "slot"
+        self.assertEqual(p.by_key("c-0000000d").line_key, "")           # Alt+6 already taken
+        self.assertEqual(p.by_key("c-0000000e").line_key, "")           # Alt+J already taken
+        self.assertEqual(p.by_key("c-0000000e").word_key, "")           # Alt+Shift+O taken
+        self.assertEqual((p.by_key("c-0000000f").line_key, p.by_key("c-0000000f").word_key),
+                         ("", ""))
         self.assertEqual(len(p.by_key("c-0000000d").label), app_module.LABEL_MAX)
-        self.assertEqual(len({e.mark for e in p.entries}), 5)
+        self.assertEqual(len({e.mark for e in p.entries}), 7)
         self.assertTrue(P.from_json(p.to_json()).same_as(p))
         with self.assertRaises(ValueError):
             P.from_json([1, 2])
         with self.assertRaises(ValueError):
             P().remove("checked")
+        self.assertEqual(app_module.compact_keys(["Alt+G", "Alt+O", "Alt+R", "Alt+C"]),
+                         "Alt+G/O/R/C")
+        self.assertEqual(app_module.compact_keys(["Alt+Shift+G", "", "Alt+Shift+C"]),
+                         "Alt+Shift+G/C")
+        self.assertEqual(app_module.compact_keys(["", ""]), "no shortcuts")
 
     def test_old_marks_file_without_legend_still_loads(self):
         self.win.close()
@@ -1522,6 +1553,245 @@ class GuiTests(unittest.TestCase):
         self.key(K.Key_Z, M.ControlModifier)
         QTest.qWait(300)
         self.assertEqual(set(self.colors_of(7, "README.md")), {self.CYAN})
+
+    # removing own colours ---------------------------------------------------------
+    def test_remove_via_legend_menu_like_a_person(self):
+        e = self.add_custom()
+        menu = self.win.legend.chip(e.key).menu()
+        [a for a in menu.actions() if a.text() == "Remove colour"][0].trigger()
+        QTest.qWait(10)
+        self.assertIsNone(self.ed.colours.by_key(e.key))
+        self.assertIsNone(self.win.legend.chip(e.key))
+
+    def test_remove_from_colour_dialog_button(self):
+        e = self.add_custom()
+        orig = app_module.ColourDialog.exec
+        self.addCleanup(setattr, app_module.ColourDialog, "exec", orig)
+        app_module.ColourDialog.exec = lambda d: app_module.ColourDialog.REMOVE
+        self.win.edit_colour(e.key)
+        self.assertIsNone(self.ed.colours.by_key(e.key))
+
+    def test_remove_saved_default_colour_everywhere(self):
+        e = self.add_custom()
+        self.mark(2, K.Key_5)
+        self.win.save_default_colours()
+        asked = []
+        self.win._ask_remove_default = lambda entry, uses: (asked.append(uses), "cancel")[1]
+        self.assertFalse(self.win.remove_colour(e.key))             # cancel: nothing changes
+        self.assertEqual(asked, [1])
+        self.assertIsNotNone(self.ed.colours.by_key(e.key))
+        self.win._ask_remove_default = lambda entry, uses: "everywhere"
+        self.assertTrue(self.win.remove_colour(e.key))
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.c("folder")})
+        with open(self.colours_file, encoding="utf-8") as f:
+            self.assertNotIn(e.key, f.read())                         # gone from the file
+        self.win.new_file(ask=False)
+        self.assertEqual(self.ed.colours.customs(), [])               # new tree: gone
+        win2 = app_module.MainWindow(None)                            # new start: gone
+        try:
+            self.assertEqual(win2.editor.colours.customs(), [])
+        finally:
+            win2.editor.document().setModified(False)
+            win2.close()
+
+    def test_remove_saved_default_colour_only_here(self):
+        e = self.add_custom()
+        self.win.save_default_colours()
+        self.win._ask_remove_default = lambda entry, uses: "here"
+        self.win.remove_colour(e.key)
+        self.assertIsNone(self.ed.colours.by_key(e.key))
+        with open(self.path + ".marks.json", encoding="utf-8") as f:   # this tree remembers
+            self.assertNotIn(e.key, f.read())
+        self.win.new_file(ask=False)
+        self.assertEqual([x.key for x in self.ed.colours.customs()], [e.key])  # still default
+
+    def test_ask_remove_default_real_message_box(self):
+        e = self.add_custom()
+        self.win.save_default_colours()
+        guard = app_module.QMessageBox.exec                       # restore the guard after
+        self.addCleanup(setattr, app_module.QMessageBox, "exec", guard)
+        app_module.QMessageBox.exec = type(self)._orig_box_exec   # a real, clickable box
+
+        def answer(text):
+            for box in QApplication.topLevelWidgets():
+                if isinstance(box, app_module.QMessageBox) and box.isVisible():
+                    [b for b in box.buttons() if b.text() == text][0].click()
+        for text, expected in (("Only from this tree", "here"), ("Remove everywhere", "everywhere")):
+            QTimer.singleShot(50, lambda t=text: answer(t))
+            self.assertEqual(self.win._ask_remove_default(e, 0), expected)
+
+    # own shortcuts ------------------------------------------------------------------
+    def keys_dialog(self, line, word, label=None, color=None):
+        """Answer the colour dialog with new shortcuts."""
+        orig = app_module.ColourDialog.exec
+        test = self
+
+        def fake(d):
+            test.last_dialog = d
+            if label is not None:
+                d.meaning.setText(label)
+            if color == "standard":
+                d.reset_colour()
+            elif color is not None:
+                d.set_colour(color)
+            d.set_keys(line, word)
+            test.last_error = d.validate()
+            return QDialog.DialogCode.Rejected if test.last_error else QDialog.DialogCode.Accepted
+        app_module.ColourDialog.exec = fake
+        self.addCleanup(setattr, app_module.ColourDialog, "exec", orig)
+
+    def test_own_shortcuts_for_custom_colour(self):
+        e = self.add_custom()
+        self.keys_dialog("Alt+K", "Alt+Shift+K")
+        self.win.edit_colour(e.key)
+        self.assertIsNone(self.last_error)
+        self.mark(2, K.Key_K)
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.CYAN})
+        self.mark(3, K.Key_5)                                        # old key does nothing
+        self.assertEqual(set(self.colors_of(3, "main.py")), {self.c("file")})
+        self.select(4, "module")
+        self.key(K.Key_K, M.AltModifier | M.ShiftModifier)
+        self.assertEqual(set(self.colors_of(4, "module")), {self.CYAN})
+        self.assertIn("Alt+K", self.win.legend.chip(e.key).toolTip())
+        with open(self.path + ".marks.json", encoding="utf-8") as f:
+            item = [c for c in json.load(f)["legend"]["colours"] if c["key"] == e.key][0]
+        self.assertEqual((item["line_key"], item["word_key"]), ("Alt+K", "Alt+Shift+K"))
+
+    def test_own_shortcuts_for_builtin_colour_and_caption(self):
+        self.keys_dialog("Alt+J", "Alt+Shift+J")
+        self.win.edit_colour("checked")
+        self.mark(2, K.Key_J)
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.c("mark_checked")})
+        self.mark(3, K.Key_G)                                        # Alt+G is free now
+        self.assertEqual(set(self.colors_of(3, "main.py")), {self.c("file")})
+        labels = {b._label: b for b in self.win.findChildren(app_module.ActionButton)}
+        self.assertEqual(labels["Mark line"]._keys(), "Alt+J/O/R/C")
+        self.assertEqual(labels["Mark words"]._keys(), "Alt+Shift+J/O/R/C")
+        self.assertEqual(self.win.a_mark_checked.text(), "Colour line: Accepted")   # prefix stays
+        self.assertIn(("Accepted", "Whole name: Alt+J  ·  Word / selection: Alt+Shift+J"),
+                      self.win._legend_help_rows())
+
+    def test_own_shortcuts_for_default_colour_and_none(self):
+        self.mark(2, K.Key_G)
+        self.keys_dialog("Alt+N", "")                                 # no word shortcut
+        self.win.edit_colour("text")
+        self.mark(2, K.Key_N)
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.c("folder")})
+        self.assertEqual(self.win.a_word_clear.shortcuts(), [])
+        self.assertIn("Default colour", self.win.a_mark_clear.text())
+
+    def test_shortcut_conflicts_are_refused(self):
+        e = self.add_custom()
+        cases = [("Ctrl+Q", "", "Delete line"), ("Ctrl+C", "", "Copy"),
+                 ("Alt+F", "", "File menu"), ("Alt+O", "", "To be approved"),
+                 ("Alt+K", "Alt+K", "different shortcuts"), ("K", "", "typed as text"),
+                 ("Shift+K", "", "typed as text"), ("Alt+1", "", "Collapse all")]
+        for line, word, expected in cases:
+            self.keys_dialog(line, word)
+            self.win.edit_colour(e.key)
+            self.assertIn(expected, self.last_error or "", (line, word))
+        self.assertEqual(e.line_key, "Alt+5")                         # unchanged
+        self.keys_dialog("F7", "Ctrl+Shift+F7")                       # F-key is fine
+        self.win.edit_colour(e.key)
+        self.assertIsNone(self.last_error)
+        self.assertEqual((e.line_key, e.word_key), ("F7", "Ctrl+Shift+F7"))
+
+    def test_own_shortcuts_saved_as_default(self):
+        self.keys_dialog("Alt+J", "Alt+Shift+J")
+        self.win.edit_colour("checked")
+        self.win.save_default_colours()
+        win2 = app_module.MainWindow(None)
+        try:
+            self.assertEqual(app_module.shortcut_text(win2.a_mark_checked), "Alt+J")
+            self.assertEqual(app_module.shortcut_text(win2.a_word_checked), "Alt+Shift+J")
+        finally:
+            win2.editor.document().setModified(False)
+            win2.close()
+
+    # changing colours of the five standard rows -------------------------------------
+    def test_change_builtin_colour_and_back_to_standard(self):
+        self.mark(2, K.Key_G)
+        self.keys_dialog("Alt+G", "Alt+Shift+G", color="#22aa44")
+        self.win.edit_colour("checked")
+        self.assertEqual(set(self.colors_of(2, "src/")), {"#22aa44"})
+        for dark in (True, False):                                    # same in both themes
+            self.win._set_dark(dark)
+            self.assertEqual(set(self.colors_of(2, "src/")), {"#22aa44"})
+            self.assertEqual(self.win.legend.chip("checked").legend_color, "#22aa44")
+        self.keys_dialog("Alt+G", "Alt+Shift+G", color="standard")
+        self.win.edit_colour("checked")
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.c("mark_checked")})
+        self.assertIsNone(self.ed.colours.by_key("checked").color)
+
+    def test_change_default_text_colour(self):
+        self.keys_dialog("Alt+C", "Alt+Shift+C", color="#ddccbb")
+        self.win.edit_colour("text")
+        self.assertEqual(set(self.colors_of(3, "main.py")), {"#ddccbb"})
+        self.assertEqual(set(self.colors_of(2, "src/")), {self.c("folder")})   # folders stay
+        self.assertEqual(self.win.legend.chip("text").legend_color, "#ddccbb")
+        self.mark(3, K.Key_R)
+        self.assertEqual(set(self.colors_of(3, "main.py")), {self.c("mark_problem")})
+
+    def test_change_explanation_colour_still_not_colourable(self):
+        self.keys_dialog("", "", label="Notes", color="#ff9fd0")
+        self.win.edit_colour("explanation")
+        self.assertIsNone(self.last_error)
+        self.assertEqual(set(self.colors_of(2, "Source code")), {"#ff9fd0"})
+        self.assertEqual(self.win.legend.chip("explanation").legend_color, "#ff9fd0")
+        self.select(2, "Source code")
+        self.key(K.Key_G, M.AltModifier | M.ShiftModifier)            # still never coloured
+        self.assertEqual(set(self.colors_of(2, "Source code")), {"#ff9fd0"})
+        self.win.close()
+        win2 = app_module.MainWindow(self.path)                        # stored with the tree
+        old = self.ed
+        try:
+            self.ed = win2.editor
+            self.assertEqual(set(self.colors_of(2, "Source code")), {"#ff9fd0"})
+            self.assertEqual(win2.legend.chip("explanation").text(), "Notes")
+        finally:
+            self.ed = old
+            win2.editor.document().setModified(False)
+            win2.close()
+
+    def test_changed_colours_count_for_validation(self):
+        self.keys_dialog("", "", color="#ff9fd0")
+        self.win.edit_colour("explanation")
+        self.patch_dialog("New", "#ff9fd0")
+        self.win.add_colour()
+        self.assertIn("already used", self.last_error)
+
+    def test_command_preview_keeps_fixed_prefix(self):
+        e = self.add_custom()
+        d = app_module.ColourDialog(self.win, self.ed.colours, self.ed.theme, entry=e,
+                                    taken=self.win.taken_shortcuts())
+        d.meaning.setText("Shared hardware")
+        self.assertIn("Colour line: Shared hardware  (Alt+5)", d.commands.text())
+        self.assertIn("Colour word / selection: Shared hardware  (Alt+Shift+5)", d.commands.text())
+        d.deleteLater()
+
+    # the "Edit legend" window -----------------------------------------------------
+    def test_legend_dialog_lists_edits_and_removes(self):
+        e = self.add_custom()
+        dlg = app_module.LegendDialog(self.win)
+        keys = [dlg.list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(dlg.list.count())]
+        self.assertEqual(keys, ["text", "checked", "explore", "problem", e.key, "explanation"])
+        self.assertIn("Alt+5", dlg.list.item(4).text())
+        dlg.list.setCurrentRow(1)
+        self.assertFalse(dlg.remove_btn.isEnabled())                  # built-in
+        dlg.list.setCurrentRow(4)
+        self.assertTrue(dlg.remove_btn.isEnabled())
+        self.keys_dialog("Alt+K", "Alt+Shift+K", label="Edited")
+        dlg.edit()
+        self.assertIn("Edited", dlg.list.currentItem().text())
+        dlg.remove()
+        self.assertIsNone(self.ed.colours.by_key(e.key))
+        self.assertEqual(dlg.list.count(), 5)
+        self.patch_dialog("Added here", "#123456")
+        dlg.add()
+        self.assertEqual(dlg.list.count(), 6)
+        self.assertIn("Added here", dlg.list.currentItem().text())
+        dlg.deleteLater()
+        self.assertIn(self.win.a_edit_legend, self.win.tree_menu.actions())
 
     def test_legend_can_be_hidden_and_shown(self):
         self.win.a_legend.trigger()

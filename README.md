@@ -74,7 +74,9 @@ Colour only the **name** of a branch (tree lines and explanations stay as they a
 | orange | To be approved | `Alt+O` | `Alt+Shift+O` |
 | red | Rejected | `Alt+R` | `Alt+Shift+R` |
 | violet | Explanation (`➡️`, fixed colour) | – | – |
-| own colours | whatever you define | `Alt+5` … `Alt+9` | `Alt+Shift+5` … `Alt+Shift+9` |
+| own colours | whatever you define | suggested `Alt+5` … `Alt+9` | `Alt+Shift+5` … `Alt+Shift+9` |
+
+All shortcuts and colours in this table can be changed in the legend (see below).
 
 Pressing the same colour key again removes the colour.
 
@@ -99,24 +101,37 @@ coloured – the colour marks work on branch names only.
 
 The **legend** below the editor always shows every colour and what it means
 (hide / show it in **View → Show colour legend**). Click a colour in the legend for its
-commands:
+commands and for **Edit meaning, colour & shortcuts…**; **Edit legend…** shows all colours
+in one list (add, edit, remove).
 
-* colour the whole name or only the word / selection,
-* **Edit meaning…** (built-in colours keep their theme colour; own colours can also get a
-  new colour),
-* **Remove colour** (own colours only – if it is used, Nodeon asks first; those names and
-  words get the default text colour again).
+For **every** colour – the default text colour, green, orange, red, the explanation colour
+and your own colours – you can change:
 
-**+ Add colour** adds an own colour with its meaning, e.g. *Same on both robots*. The
-first five own colours get the shortcuts `Alt+5` … `Alt+9` (whole name) and
-`Alt+Shift+5` … `Alt+Shift+9` (word); every own colour is also in the legend, the
-**Mark line** / **Mark words** menus, the Tree menu and the right-click menu. A colour
-or meaning that is already used is refused, so the legend stays unambiguous.
+* the **meaning** (the text in the legend and after the fixed command names
+  "Colour line:" / "Colour word / selection:"),
+* the **colour** (**Standard** goes back to the theme colour of light / dark mode),
+* the **shortcuts** for "whole name" and "word / selection" (**None** = no shortcut).
+  The explanation colour has no shortcuts – explanations are never coloured by a command.
+
+Shortcuts that are already used (by another colour, any other command, Copy / Paste or a
+menu), the same key for both commands, and keys that would type text (no Ctrl / Alt /
+F-key) are refused with a message saying why.
+
+**+ Add colour** adds an own colour with its meaning, e.g. *Same on both robots*. Free
+shortcuts are suggested (`Alt+5` … `Alt+9`, `Alt+Shift+5` … `Alt+Shift+9`); change them as
+you like. A colour or meaning that is already used is refused, so the legend stays
+unambiguous.
+
+**Remove colour** (own colours: legend menu, **Edit legend…** or the button in the colour
+window). If the colour is used, its names and words get the default text colour again. If
+the colour is also in your **default legend**, Nodeon asks whether to remove it
+**everywhere** (also from the default, so new trees no longer get it) or **only from this
+tree**.
 
 Each tree keeps its own legend in `<name>.txt.marks.json`.
 
-**Save as default** stores the current legend (all meanings and own colours) as the
-standard for **every new tree**, in `nodeon_colours.json` in your user settings folder
+**Save as default** stores the current legend (meanings, colours, shortcuts, own colours) as
+the standard for **every new tree**, in `nodeon_colours.json` in your user settings folder
 (the exact path is shown in the tooltip and after saving). **Load default** adds the colours
 of that default legend to the tree that is open. To share one legend with a team, set the
 environment variable `NODEON_COLORS_FILE` to a common file.
